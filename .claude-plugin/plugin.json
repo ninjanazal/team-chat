@@ -1,0 +1,18 @@
+{
+  "name": "team-chat",
+  "version": "0.1.0",
+  "description": "Run a fixed team of subagents from a mission-control pane: member cards, live status, team channel and DMs.",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Eurico Martins"
+  },
+  "repository": "https://github.com/ninjanazal/team-chat",
+  "keywords": [
+    "agents",
+    "team",
+    "subagents",
+    "pane",
+    "orchestration"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "team-chat",
+  "owner": { "name": "Eurico Martins" },
+  "description": "Claude Code plugins by Eurico Martins.",
+  "plugins": [
+    {
+      "name": "team-chat",
+      "source": "./",
+      "description": "Run fixed teams of Claude Code subagents from a mission-control pane."
+    }
+  ]
+}
