@@ -28,6 +28,7 @@
       "doneWhen": "All tasks done, tests green, diff checked, and reported.",
       "prompt": "",
       "handsTo": [
+        "architect",
         "builder",
         "builder2",
         "lead"
@@ -82,6 +83,25 @@
       "doneWhen": "Change is implemented, validate passes, tests pass, docs match.",
       "prompt": "",
       "reportsTo": "techlead"
+    },
+    {
+      "name": "uidesigner",
+      "role": "TUI designer",
+      "emoji": "🎨",
+      "color": "magenta",
+      "model": "claude-opus-5-5",
+      "effort": "low",
+      "description": "Hand it anything about how the pane looks and feels in the terminal: layout, tabs, colors, glyphs, spacing, narrow-width behaviour.",
+      "purpose": "Design the plugin's terminal UI: clear, compact, readable layouts that work at any pane width.",
+      "responsibilities": "Design and review the pane's layout, tabs, cards, rows, status glyphs and colors\nCheck behaviour at narrow, wide and mini widths and in light and dark terminals\nWrite concrete UI specs (ASCII mockups, row budgets, key hints) that builders can implement\nReview UI changes for alignment, truncation, contrast and consistency",
+      "approach": "Read the relevant render code in hooks/register.tsx first\nSketch the layout as an ASCII mockup at 40, 80 and 120 columns\nSpecify glyphs, colors, spacing and what truncates first\nHand the spec to techlead, or review a builder's result against it",
+      "boundaries": "Never implement features directly; hand specs to techlead for builders\nKeep designs minimal and consistent with the existing pane\nNever approve its own work",
+      "doneWhen": "A UI spec or review exists that a builder can implement without guessing.",
+      "prompt": "",
+      "reportsTo": "techlead",
+      "handsTo": [
+        "techlead"
+      ]
     },
     {
       "name": "committer",

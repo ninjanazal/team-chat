@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { afterCall, keepsFlag, permissionFlag } from './register'
+import { afterCall, keepsFlag, ctxBar, marqueeSlice, permissionFlag, schedulePermissionFlag, cancelPendingAsk } from './register'
 
 const PANE = {
   plugin: 'team-chat',
@@ -38,6 +38,7 @@ test('cards show members, and a spawn plus a tool call mark backend working', as
   on('clock.every', () => ({ value: undefined }))
   on('clock.now', () => ({ value: Date.UTC(2026, 10, 3, 14, 2) }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false } }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   on('tool.call', () => ({ result: '' }))
@@ -84,6 +85,7 @@ function stubEngine(on: Parameters<Parameters<typeof test>[1]>[1], written: stri
   })
   on('clock.now', () => ({ value: Date.UTC(2026, 10, 3, 14, 2) }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
 }
 
 test('the + member form adds a member, saves team.json and registers it', async ($, on) => {
@@ -266,6 +268,7 @@ test('two teams: the pane asks which one, picking registers its members, the pic
   on('store.set', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -296,6 +299,7 @@ test('a working member gets a task line and a model-written summary of what it i
   on('tool.register', () => ({ value: {} }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   on('tool.call', () => ({ result: '' }))
   on('agent.list', () => ({ value: [{ id: 'a1', status: 'running', description: '', type: 'team-chat:backend' }] }))
@@ -318,6 +322,37 @@ test('a working member gets a task line and a model-written summary of what it i
   await ui.unmount()
 })
 
+test('each card has a status label inside its box, on the name row, and the card rows still count in the scroll budget', async ($, on) => {
+  on('fs.list', () => ({ value: [{ name: 'dev-team.json', kind: 'file', size: TEAM.length, mtimeMs: 1, isLink: false }] }))
+  on('fs.read', (_, e) => { if ((e as { path: string }).path.endsWith('.active')) throw new Error('ENOENT'); return { value: TEAM } })
+  on('agent.register', (_, e) => ({ value: { agent: `team-chat:${e.name}` } }))
+  on('command.register', () => ({ value: { command: 'team' } }))
+  on('tool.register', () => ({ value: {} }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: Date.UTC(2026, 10, 3, 14, 2) }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false } }))
+  on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
+  on('tool.call', () => ({ result: '' }))
+  on('session.send', () => ({ isDelivered: true }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /idle/ })) !== undefined).toBe(true)
+  await $.agent.spawn({ prompt: 'Add GET /health', description: 'health endpoint', subagentType: 'team-chat:backend' })
+  await $.tool.call({ tool: 'Bash', command: 'npm test', agentId: 'a1' } as never)
+  expect((await ui.find({ type: 'Text', text: /^ .* working/ })) !== undefined).toBe(true)
+  await ui.unmount()
+
+  // A pane too short for the card (label + box) scrolls instead of showing it whole.
+  const small = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 4 } }, surface: 'desktop' })
+  expect(await small.find({ key: 'status:backend' })).toBe(undefined)
+  await small.unmount()
+})
+
 test('with no team files, /team list and start_team say there is no team and suggest /team-chat:create', async ($, on) => {
   on('fs.list', () => ({ value: [] }))
   on('fs.read', () => { throw new Error('ENOENT') })
@@ -333,6 +368,7 @@ test('with no team files, /team list and start_team say there is no team and sug
   on('store.set', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
 
   const list = await $.command.run({ command: 'team', args: 'list' } as never)
@@ -379,6 +415,7 @@ test('save_team writes the team with the lead added, registers the members and m
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
 
   const res = await $.tool.call({
@@ -456,6 +493,7 @@ test('team files: a member writes one, it is indexed with its author, posted, re
   on('store.set', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   await $.agent.spawn({ prompt: 'Design the API', description: 'api plan', subagentType: 'team-chat:backend' })
@@ -511,6 +549,7 @@ test('a second session.start (/new) keeps the team, skips the picker and re-tell
     return next(e)
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   expect(appended.length).toBe(0)
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
@@ -543,6 +582,7 @@ test('a member that ends BLOCKED or asks the person gets a needs-help or needs-h
   on('store.set', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   on('tool.call', () => ({ result: '' }))
   on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
@@ -550,12 +590,12 @@ test('a member that ends BLOCKED or asks the person gets a needs-help or needs-h
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   await $.agent.spawn({ prompt: 'Add GET /health', description: 'health endpoint', subagentType: 'team-chat:backend' })
 
-  await $.turn.complete({ agentId: 'a1', answer: 'BLOCKED: waiting for the schema from lead' } as never)
+  await $.session.send({ to: 'lead', text: 'BLOCKED: waiting for the schema from lead', agentId: 'a1', origin: { kind: 'model' } } as never)
   let ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /needs help: waiting for the schema/ })) !== undefined).toBe(true)
   await ui.unmount()
 
-  await $.turn.complete({ agentId: 'a1', answer: 'Is this fine?\n```\nNEEDS-HUMAN: in code\n```\nNEEDS-HUMAN: Should I drop the old table?' } as never)
+  await $.session.send({ to: 'lead', text: 'Is this fine?\n```\nNEEDS-HUMAN: in code\n```\nNEEDS-HUMAN: Should I drop the old table?', agentId: 'a1', origin: { kind: 'model' } } as never)
   ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /needs you: .*Should I drop the old table\?/ })) !== undefined).toBe(true)
   await ui.unmount()
@@ -569,6 +609,15 @@ test('a member that ends BLOCKED or asks the person gets a needs-help or needs-h
   ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /needs (you|help)/ })) === undefined).toBe(true)
   await ui.unmount()
+
+  // A finished member never shows a flag, even when its last words were BLOCKED: or NEEDS-HUMAN:.
+  for (const answer of ['BLOCKED: I could not reach builder or architect', 'NEEDS-HUMAN: may I drop it?', 'BLOCKED: need permission to run Bash']) {
+    await $.turn.complete({ agentId: 'a1', answer } as never)
+    ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect((await ui.find({ type: 'Text', text: /needs (you|help)/ })) === undefined).toBe(true)
+    expect((await ui.find({ type: 'Text', text: /done/ })) !== undefined).toBe(true)
+    await ui.unmount()
+  }
 
   await $.tool.call({ tool: 'Bash', command: 'npm test', agentId: 'a1' } as never)
   ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -598,6 +647,7 @@ test('each session.start registers its own poll and animate intervals (the older
   on('store.set', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   expect(ticks.length).toBe(4)
@@ -624,6 +674,7 @@ test('the switch button is replaced by a reason while a member works, and channe
   on('store.set', () => ({ value: undefined }))
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
@@ -659,6 +710,7 @@ function stubTeam(on: Parameters<Parameters<typeof test>[1]>[1], ticks?: (() => 
   on('tool.call', (_, e) => ((e as { tool: string }).tool === 'Write' ? { result: '', isError: true } : { result: '' }) as never)
 }
 
+const HINT = { plugin: 'team-chat', component: 'PromptHint', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' }, surface: 'desktop' } as never
 const STEP = { turnId: 't1', index: 0, model: 'claude-sonnet-4-5', messageCount: 3, agentId: 'a1' } as never
 
 test('per-member stats from turn.step usage, max_tokens in red, receipt counts agents and edits', async ($, on) => {
@@ -718,57 +770,58 @@ test('narrow width auto-falls back to rows with ctx hidden; layout wide forces c
   expect(String((bare as { text: string }).text)).toContain('Usage: /team view')
 })
 
-test('the log toggles with l, lists edits and spawns, and filters to the expanded member', async ($, on) => {
-  stubTeam(on)
-  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.agent.spawn({ prompt: 'Add GET /health', description: 'health endpoint', subagentType: 'team-chat:backend' })
-  await $.tool.call({ tool: 'Edit', file_path: 'src/a.ts', agentId: 'a1' } as never)
-  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /backend edit/ })).toBe(undefined)
-  await ui.press({ key: 'log' })
-  expect((await ui.find({ type: 'Text', text: /backend edit · Edit src\/a\.ts/ })) !== undefined).toBe(true)
-  expect((await ui.find({ type: 'Text', text: /lead spawn/ })) !== undefined).toBe(true)
-  await ui.press({ key: 'card:backend' })
-  expect(await ui.find({ type: 'Text', text: /lead spawn/ })).toBe(undefined)
-  expect((await ui.find({ type: 'Text', text: /backend edit/ })) !== undefined).toBe(true)
-  await ui.press({ key: 'log' })
-  expect(await ui.find({ type: 'Text', text: /backend edit/ })).toBe(undefined)
-  await ui.unmount()
-})
-
-test('the needs-help banner survives the status poll reporting idle or completed, and a failure clears it', async ($, on) => {
+test('a needs-help flag clears when the status poll reports idle, completed or running; a finished BLOCKED answer is never flagged', async ($, on) => {
   const ticks: (() => void)[] = []
   stubTeam(on, ticks)
   let status = 'idle'
+  on('session.send', () => ({ isDelivered: true }))
   on('agent.list', () => ({ value: [{ id: 'a1', status, description: '', type: 'team-chat:backend' }] }))
   on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
-  await $.turn.complete({ agentId: 'a1', answer: 'BLOCKED: need the schema' } as never)
   const poll = async () => { for (const t of ticks) t(); await new Promise(r => setTimeout(r, 20)) }
+  const shows = async (re: RegExp) => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const got = (await ui.find({ type: 'Text', text: re })) !== undefined
+    await ui.unmount()
+    return got
+  }
+  const block = () => $.session.send({ to: 'lead', text: 'BLOCKED: need the schema', agentId: 'a1', origin: { kind: 'model' } } as never)
 
-  for (const s of ['idle', 'completed', 'running']) {
+  // The engine saying idle or completed means the member is over, so the flag clears.
+  for (const s of ['idle', 'completed']) {
+    await block()
     status = s
     await poll()
-    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-    expect((await ui.find({ type: 'Text', text: /needs help: need the schema/ })) !== undefined).toBe(true)
-    await ui.unmount()
+    expect(await shows(/needs help/)).toBe(false)
   }
+  // Running again after its own BLOCKED words is a resume.
+  status = 'running'
+  await block()
+  await poll()
+  await $.session.send({ to: 'backend', text: 'carry on', origin: { kind: 'user' } } as never)
+  expect(await shows(/needs help/)).toBe(false)
+  // The BLOCKED answer of a finished member: done, no flag, after the poll too.
+  await $.turn.complete({ agentId: 'a1', answer: 'BLOCKED: I could not reach builder or architect' } as never)
+  status = 'completed'
+  await poll()
+  expect(await shows(/needs help/)).toBe(false)
+  expect(await shows(/done/)).toBe(true)
+  // A failure never keeps one either.
+  status = 'running'
+  await block()
   status = 'failed'
   await poll()
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /needs help/ })).toBe(undefined)
-  await ui.unmount()
+  expect(await shows(/needs help/)).toBe(false)
 })
 
 test('compact rows and the mini line show the needs-help reason, a long role at 50 columns still renders, and a row expands in place', async ($, on) => {
   stubTeam(on)
+  on('session.send', () => ({ isDelivered: true }))
   on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.agent.spawn({ prompt: 'x', description: 'a long task description for the card', subagentType: 'team-chat:backend' })
-  await $.turn.complete({ agentId: 'a1', answer: 'NEEDS-HUMAN: may I drop the old users table?' } as never)
+  await $.session.send({ to: 'lead', text: 'NEEDS-HUMAN: may I drop the old users table?', agentId: 'a1', origin: { kind: 'model' } } as never)
   const narrow = { ...PANE, props: { ...PANE.props, bodyColumns: 50 }, surface: 'desktop' } as const
 
   let ui = await $.ui.mount(narrow)
@@ -1020,35 +1073,19 @@ test('/team v2: unknown input suggests or refuses without opening the pane or qu
   expect(await run('layout mini')).toContain('mini')
 })
 
-test('the needs-help banner and the working strip stay in the fixed header on every tab, also when scrolled', async ($, on) => {
+test('there is no banner above the tabs: flagged members show only on their cards, and the tabs stay', async ($, on) => {
   stubTeam(on)
   on('session.send', () => ({ isDelivered: true }))
-  on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
-  on('prompt.fill', () => ({ isFilled: true }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
-  // Working: the strip shows it on each tab.
-  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 0, bodyRows: 9 } }, surface: 'desktop' } as never)
-  for (const tab of ['overview', 'chat', 'files', 'queue']) {
-    await ui.press({ key: `tab:${tab}` })
-    expect((await ui.find({ key: 'working-strip' })) !== undefined).toBe(true)
-  }
-  for (let n = 1; n <= 30; n++) await $.session.send({ to: 'backend', text: `message number ${n}`, origin: { kind: 'model' } } as never)
-  await $.turn.complete({ agentId: 'a1', answer: 'BLOCKED: need the schema' } as never)
-  for (const tab of ['overview', 'chat', 'files', 'queue']) {
-    await ui.press({ key: `tab:${tab}` })
-    expect((await ui.find({ key: 'banner:backend' })) !== undefined).toBe(true)
-    expect((await ui.find({ type: 'Text', text: /need the schema/ })) !== undefined).toBe(true)
-    expect((await ui.find({ key: 'flag:backend' })) !== undefined).toBe(true)
-    expect(await ui.find({ key: 'working-strip' })).toBe(undefined)
-  }
-  // Scrolled up in Chat: still there; answering opens the conversation.
-  await ui.press({ key: 'tab:chat' })
-  await ui.press({ key: 'body:up' })
-  expect((await ui.find({ key: 'banner:backend' })) !== undefined).toBe(true)
-  await ui.press({ key: 'tab:overview' })
-  await ui.press({ key: 'flag:backend' })
-  expect((await ui.find({ type: 'Text', text: /To: / })) !== undefined).toBe(true)
+  await $.session.send({ to: 'lead', text: 'BLOCKED: need the schema', agentId: 'a1', origin: { kind: 'model' } } as never)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'banner:backend' })).toBe(undefined)
+  expect(await ui.find({ key: 'flag:backend' })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /\d+ need (help|you)/ })).toBe(undefined)
+  expect((await ui.find({ key: 'tab:overview' })) !== undefined).toBe(true)
+  expect((await ui.find({ key: 'card:backend' })) !== undefined).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /needs help: need the schema/ })) !== undefined).toBe(true)
   await ui.unmount()
 })
 
@@ -1213,6 +1250,7 @@ test('switching teams clears the queue and never saves the old queue under the n
   on('store.set', (_, e) => { sets.push([(e as { key: string }).key, JSON.stringify((e as { value: unknown }).value)]); return { value: undefined } })
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   await $.command.run({ command: 'team', args: 'dev-team' } as never)
@@ -1275,6 +1313,7 @@ function twoTeams(on: Parameters<Parameters<typeof test>[1]>[1], hooks: { gateRe
   on('store.set', (_, e) => { sets.push([(e as { key: string }).key, JSON.stringify((e as { value: unknown }).value)]); return { value: undefined } })
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   on('agent.spawn', () => ({ agentId: 'a1', model: 'sonnet' }))
   on('session.send', async () => { await hooks.gateSend; return { isDelivered: true } })
   on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
@@ -1354,6 +1393,7 @@ test('save_team accepts relations and rejects unknown, self, loop and lead relat
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: JSON.stringify(e).includes('TEAM_CHAT') ? 'on' : undefined }))
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
   const base = { model: 'sonnet', effort: 'low', purpose: 'p' }
   const save = async (name: string, members: unknown[]) =>
@@ -1415,6 +1455,27 @@ test('a hand-edited bad file loads with the bad relations dropped; remove repare
   expect(by('b')).toBeUndefined()
   expect('reportsTo' in by('c')).toBe(false) // b answered to the lead, so c now does
   expect(by('a').handsTo ?? []).not.toContain('b')
+  await ui.unmount()
+})
+
+test('Chain tab: a tree with connectors, role, model and handsTo arrows; the old Overview chain button is gone', async ($, on) => {
+  const written: string[] = []
+  written.push(JSON.stringify({ name: 'dev-team', members: [LEAD, mem('a', { handsTo: ['b'] }), mem('b', { reportsTo: 'a' }), mem('c')] }))
+  stubEngine(on, written, [])
+  on('store.set', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'chain' })).toBe(undefined)
+  await ui.press({ key: 'tab:chain' })
+  expect(["{ type: 'Text', text: /you/ }", (await ui.find({ type: 'Text', text: /you/ })) !== undefined]).toEqual(["{ type: 'Text', text: /you/ }", true])
+  expect(["{ type: 'Text', text: /├─ / }", (await ui.find({ type: 'Text', text: /├─ / })) !== undefined]).toEqual(["{ type: 'Text', text: /├─ / }", true])
+  expect(["{ type: 'Text', text: /└─ / }", (await ui.find({ type: 'Text', text: /└─ / })) !== undefined]).toEqual(["{ type: 'Text', text: /└─ / }", true])
+  expect(["{ type: 'Text', text: /⇢ b/ }", (await ui.find({ type: 'Text', text: /⇢ b/ })) !== undefined]).toEqual(["{ type: 'Text', text: /⇢ b/ }", true])
+  // Role and model share the middle column; "hands to" is a dim right-column header; the legend names the connectors.
+  expect(["role · model", (await ui.find({ type: 'Text', text: /A · sonnet/ })) !== undefined]).toEqual(["role · model", true])
+  expect(["hands to header", (await ui.find({ type: 'Text', text: /hands to/ })) !== undefined]).toEqual(["hands to header", true])
+  expect(["legend", (await ui.find({ type: 'Text', text: /reports to/ })) !== undefined]).toEqual(["legend", true])
+  expect(await ui.find({ key: 'card:a' })).toBe(undefined)
   await ui.unmount()
 })
 
@@ -1547,7 +1608,7 @@ test('main: @lead with a main set reaches the lead without the prefix; removing 
   expect(res).not.toContain('Error')
 })
 
-test('needs-help flag: set early on a permission ask, cleared by its own call or a poll; a held (waiting) agent is not flagged; resume clears', async ($, on) => {
+test('needs-help flag: set after a short delay on a permission ask, cleared by its own call or a poll; a held (waiting) agent is not flagged; resume clears', async ($, on) => {
   const ticks: (() => void)[] = []
   stubTeam(on, ticks)
   let status = 'running'
@@ -1577,8 +1638,18 @@ test('needs-help flag: set early on a permission ask, cleared by its own call or
   // Two different ids never clear each other, even for the same tool (parallel Bash calls).
   expect((afterCall({ ...(flagged as object), flagCall: 'u1', flagTool: 'Bash' } as never, { tool: 'Bash', tool_use_id: 'u2' }) as { status: string }).status).toBe('human')
   // A poll-set permission flag (no call) does not survive the next tool call; a call-bound one does.
-  expect(keepsFlag({ status: 'human', flagSource: 'permission' } as never, false)).toBe(false)
-  expect(keepsFlag({ status: 'human', flagSource: 'permission', flagCall: 'u1', flagTool: 'Bash' } as never, false)).toBe(true)
+  // A needs-you flag persists across any later call until the person responds, whatever its source.
+  expect(keepsFlag({ status: 'human', flagSource: 'permission' } as never, false)).toBe(true)
+  expect(keepsFlag({ status: 'human', flagSource: 'message' } as never, false)).toBe(false)
+  expect(keepsFlag({ status: 'human', flagSource: 'message' } as never, true)).toBe(true)
+  expect(keepsFlag({ status: 'working' } as never, false)).toBe(false)
+  // The pending call itself starting keeps its prompt flag; any other step clears it.
+  const pending = { status: 'human', flagSource: 'permission', flagCall: 'u1', flagTool: 'Bash' } as never
+  expect(keepsFlag(pending, false, { tool: 'Bash', tool_use_id: 'u1' })).toBe(true)
+  expect(keepsFlag(pending, false, { tool: 'Bash' })).toBe(true)
+  expect(keepsFlag(pending, false, { tool: 'Bash', tool_use_id: 'u2' })).toBe(false)
+  expect(keepsFlag(pending, false, { tool: 'Read', tool_use_id: 'u2' })).toBe(false)
+  expect(keepsFlag(pending, false, { tool: 'Read' })).toBe(false)
   expect(keepsFlag({ status: 'waiting', flagSource: 'message' } as never, true)).toBe(true)
   expect(keepsFlag({ status: 'waiting', flagSource: 'message' } as never, false)).toBe(false)
   // The check had an id, the call has none (or another): the same tool still clears it.
@@ -1591,7 +1662,7 @@ test('needs-help flag: set early on a permission ask, cleared by its own call or
   expect(await shows(/needs you/)).toBe(false)
   expect(await shows(/working/)).toBe(true)
   // A real ask by the member stays through a 'waiting' poll.
-  await $.turn.complete({ agentId: 'a1', answer: 'NEEDS-HUMAN: may I drop it?' } as never)
+  await $.session.send({ to: 'lead', text: 'NEEDS-HUMAN: may I drop it?', agentId: 'a1', origin: { kind: 'model' } } as never)
   await poll()
   expect(await shows(/needs you: may I drop it/)).toBe(true)
 
@@ -1622,4 +1693,247 @@ test('needs-help flag: BLOCKED in a mid-run SendMessage flags the member; its ow
 
   await $.session.send({ to: 'lead', text: 'NEEDS-HUMAN: may I drop the table?', agentId: 'a1', origin: { kind: 'model' } } as never)
   expect(await shows(/needs you: may I drop the table/)).toBe(true)
+})
+
+test('marqueeSlice: static when it fits, pauses at the start, loops with a gap, stays width-safe for wide chars', () => {
+  expect(marqueeSlice('short', 10, 99)).toBe('short')
+  const t = 'abcdefghij klmnop'
+  expect(marqueeSlice(t, 8, 0)).toBe('abcdefgh')
+  expect(marqueeSlice(t, 8, 5)).toBe('abcdefgh')
+  expect(marqueeSlice(t, 8, 8)).toBe('cdefghij')
+  const period = t.length + 3 + 6
+  expect(marqueeSlice(t, 8, period)).toBe('abcdefgh')
+  for (let f = 0; f < 40; f++) {
+    const s = marqueeSlice('日本語のテキスト👍 more', 7, f)
+    expect([...s].reduce((a, c) => a + ((c.codePointAt(0) ?? 0) > 0x2e80 ? 2 : 1), 0)).toBe(7)
+  }
+})
+
+test('context row: bar text and width, narrow form, color thresholds, hidden without tokens, session.measure feeds the pane', async ($, on) => {
+  expect(ctxBar({ tokens: 38000, window: 200000, percent: 19 }, 90)).toMatchObject({ text: '🧠 █▉░░░░░░░░ 19%', color: 'subtle' })
+  expect(ctxBar({ tokens: 38000, window: 200000, percent: 19 }, 19)?.text).toBe('█▉░░░░░░░░')
+  for (const c of [0, 55, 100]) expect([...(ctxBar({ tokens: 1, window: 100, percent: c }, 19)?.text ?? '')].length).toBe(10)
+  expect(ctxBar({ tokens: 1, window: 100, percent: 69 }, 90)?.color).toBe('subtle')
+  expect(ctxBar({ tokens: 1, window: 100, percent: 70 }, 90)?.color).toBe('warning')
+  expect(ctxBar({ tokens: 1, window: 100, percent: 90 }, 90)?.color).toBe('warning')
+  expect(ctxBar({ tokens: 1, window: 100, percent: 91 }, 90)?.color).toBe('error')
+  expect(ctxBar({ window: 200000 }, 90)).toBe(undefined)
+
+  stubTeam(on)
+  on('session.measure', () => ({ changed: ['context'] }))
+  const paneShows = async (re: RegExp, width?: number) => {
+    const props = width ? { ...PANE.props, bodyColumns: width } : PANE.props
+    const ui = await $.ui.mount({ ...PANE, props, surface: 'desktop' } as never)
+    const got = await ui.find({ type: 'Text', text: re })
+    await ui.unmount()
+    return got !== undefined
+  }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await paneShows(/█|░/)).toBe(false)
+  await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
+  await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' } as never)
+  expect(await paneShows(/█|░/)).toBe(false)
+  await $.session.measure({ context: { tokens: 150000, window: 200000, percent: 75 }, rateLimits: [], changed: ['context'] } as never)
+  expect(await paneShows(/🧠 ███████▌░░ 75%/)).toBe(true)
+})
+
+test('ctxBar limit parts: 5h and wk percent, hidden when missing, dropped at narrow widths, worst color wins', () => {
+  const c = { tokens: 38000, window: 200000, percent: 19 }
+  const rl = [{ kind: 'five_hour', percentUsed: 40.4 }, { kind: 'seven_day', percentUsed: 12 }]
+  expect(ctxBar(c, 90, rl)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% · 📅 wk 12%')
+  expect(ctxBar(c, 90, [rl[1]])?.text).toBe('🧠 █▉░░░░░░░░ 19% · 📅 wk 12%')
+  expect(ctxBar(c, 90, [{ kind: 'spend_limit', percentUsed: 50 }])?.text).toBe('🧠 █▉░░░░░░░░ 19%')
+  expect(ctxBar(c, 90, [])?.text).toBe('🧠 █▉░░░░░░░░ 19%')
+  expect(ctxBar(c, 39, rl)?.text).toBe('🧠 █▉░░░░░░░░ 19%')
+  expect(ctxBar(c, 19, rl)?.text).toBe('█▉░░░░░░░░')
+  expect(ctxBar(c, 90, [{ kind: 'five_hour', percentUsed: 95 }])?.color).toBe('error')
+  expect(ctxBar(c, 90, [{ kind: 'seven_day', percentUsed: 75 }])?.color).toBe('warning')
+  expect(ctxBar(c, 39, [{ kind: 'five_hour', percentUsed: 95 }])?.color).toBe('subtle')
+  expect(ctxBar(undefined, 90, rl)?.text).toBe('⏳ 5h 40% · 📅 wk 12%')
+  expect(ctxBar(undefined, 90, [])).toBe(undefined)
+})
+
+test('context bar is the last row of the pane, with limits; narrow widths drop parts; the prompt hint has no tail', async ($, on) => {
+  stubTeam(on)
+  on('session.measure', () => ({ changed: ['context'] }))
+  let tail: unknown = 'unset'
+  on('ui.render', { component: 'PromptHint' }, ($, e) => { tail = (e as { props: { tail?: string } }).props.tail; const { Text } = $.ui.resolve(e as never); return (<Text>hint</Text>) as never })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
+  await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' } as never)
+  await $.session.measure({ context: { tokens: 38000, window: 200000, percent: 19 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }, { kind: 'seven_day', percentUsed: 12 }], changed: ['context', 'rateLimits'] } as never)
+  await $.ui.mount(HINT)
+  expect(tail).toBe(undefined)
+  const shows = async (re: RegExp, width?: number) => {
+    const props = width ? { ...PANE.props, bodyColumns: width } : PANE.props
+    const ui = await $.ui.mount({ ...PANE, props, surface: 'desktop' } as never)
+    const got = await ui.find({ type: 'Text', text: re })
+    await ui.unmount()
+    return got !== undefined
+  }
+  expect(await shows(/🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% · 📅 wk 12%/)).toBe(true)
+  expect(await shows(/🧠 █▉░░░░░░░░ 19%$/, 39)).toBe(true)
+  expect(await shows(/5h/, 39)).toBe(false)
+  expect(await shows(/^█▉░░░░░░░░$/, 19)).toBe(true)
+})
+
+test('a finished member is never flagged; a newer message from the member supersedes its blocked one', async ($, on) => {
+  stubTeam(on)
+  on('session.send', () => ({ isDelivered: true }))
+  on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
+  const shows = async (re: RegExp) => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const got = (await ui.find({ type: 'Text', text: re })) !== undefined
+    await ui.unmount()
+    return got
+  }
+  const say = (text: string) => $.session.send({ to: 'lead', text, agentId: 'a1', origin: { kind: 'model' } } as never)
+  await $.turn.complete({ agentId: 'a1', answer: 'BLOCKED: I could not reach builder' } as never)
+  expect(await shows(/needs help/)).toBe(false)
+
+  await say('BLOCKED: I could not reach builder')
+  expect(await shows(/needs help: I could not reach builder/)).toBe(true)
+  await say('builder answered, continuing')
+  expect(await shows(/needs help/)).toBe(false)
+
+  await say('NEEDS-HUMAN: may I drop the table?')
+  expect(await shows(/needs you: may I drop the table/)).toBe(true)
+  await $.turn.complete({ agentId: 'a1', answer: 'finished' } as never)
+  expect(await shows(/needs you/)).toBe(false)
+})
+
+test('permission flag is delayed: it fires only if the same call is still pending, and a call start or end cancels it', async () => {
+  const wait = (ms: number) => new Promise(r => setTimeout(r, ms))
+  const fired: string[] = []
+  const ask = { tool: 'Bash', tool_use_id: 'u1', agentId: 'a1' }
+  // Still pending after the delay: flagged.
+  schedulePermissionFlag(f => fired.push(String(f.reason)), ask, { decision: 'ask' }, 20)
+  expect(fired).toEqual([])
+  await wait(50)
+  expect(fired).toEqual(['permission: Bash'])
+  // The same call starts or ends before the delay (no prompt shown): never flagged.
+  schedulePermissionFlag(f => fired.push('late'), ask, { decision: 'ask' }, 20)
+  cancelPendingAsk({ tool: 'Bash', tool_use_id: 'u1', agentId: 'a1' })
+  // Id missing on the call: the tool name matches.
+  schedulePermissionFlag(f => fired.push('late'), ask, { decision: 'ask' }, 20)
+  cancelPendingAsk({ tool: 'Bash', agentId: 'a1' })
+  // A different call (other id) does not cancel it.
+  schedulePermissionFlag(f => fired.push('other'), ask, { decision: 'ask' }, 20)
+  cancelPendingAsk({ tool: 'Bash', tool_use_id: 'u2', agentId: 'a1' })
+  // A non-ask verdict schedules nothing.
+  schedulePermissionFlag(f => fired.push('allow'), ask, { decision: 'allow' }, 20)
+  await wait(50)
+  expect(fired).toEqual(['permission: Bash', 'other'])
+})
+
+test('a permission flag clears when its call ends, when another step starts, or when the member finishes; the pending call keeps it', async ($, on) => {
+  stubTeam(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
+  // The flag is set from the pure hook body (the harness does not run the plugin's own tool.check), tied to the call.
+  const flagged = { status: 'human', steps: 0, recent: [], ...permissionFlag({ tool: 'Bash', tool_use_id: 'u1', agentId: 'a1' }, { decision: 'ask' }) } as never
+  // Answered or denied: its own call ends.
+  expect((afterCall(flagged, { tool: 'Bash', tool_use_id: 'u1' }) as { status: string; reason?: string }).status).toBe('working')
+  expect((afterCall(flagged, { tool: 'Bash', tool_use_id: 'u1' }) as { reason?: string }).reason).toBe(undefined)
+  // Next step starts (a different call): not kept. The same call starting (the prompt is open): kept.
+  expect(keepsFlag(flagged, false, { tool: 'Read', tool_use_id: 'u2' })).toBe(false)
+  expect(keepsFlag(flagged, false, { tool: 'Bash', tool_use_id: 'u1' })).toBe(true)
+})
+
+test('counts row shows only attention counts and is gone when there are none', async ($, on) => {
+  stubTeam(on)
+  on('session.send', () => ({ isDelivered: true }))
+  on('turn.complete', (_, e) => ({ text: (e as { answer: string }).answer }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const shows = async (re: RegExp) => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const got = (await ui.find({ type: 'Text', text: re })) !== undefined
+    await ui.unmount()
+    return got
+  }
+  await $.agent.spawn({ name: 'backend', prompt: 'x' } as never).catch(() => undefined)
+  expect(await shows(/\d+ working/)).toBe(false)
+  expect(await shows(/all quiet/)).toBe(false)
+})
+
+test('usage row shows on an idle crew as soon as the pane loads, centered; /team on refills it', async ($, on) => {
+  stubTeam(on)
+  on('session.usage', () => ({ value: { context: { tokens: 100000, window: 200000, percent: 50 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }, { kind: 'seven_day', percentUsed: 12 }] } }) as never)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /🧠 .* 50%/ })) !== undefined).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /5h/ })) !== undefined).toBe(true)
+  expect((await ui.find({ type: 'Box', key: 'usage', justifyContent: 'center' } as never)) !== undefined).toBe(true)
+  expect((await ui.find({ type: 'Box', key: 'usage-rule' } as never)) !== undefined).toBe(true)
+  await ui.unmount()
+})
+
+test('team view is off by default; /team on persists it, /team off clears it, /team says how to turn it on', async ($, on) => {
+  const stored: Record<string, unknown> = {}
+  stubTeam(on, undefined, { store: true, get: true })
+  on('store.get', (_, e) => ({ value: stored[(e as { key: string }).key] }))
+  on('store.set', (_, e) => { stored[(e as { key: string }).key] = (e as { value: unknown }).value; return { value: undefined } })
+  on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('prompt.compose', () => ({ sections: [] }))
+  const closed: string[] = []
+  on('ui.close', (_, e) => { closed.push((e as { id: string }).id); return { value: undefined } as never })
+  const sections = async () => ((await $.prompt.compose({ promptModel: 'm', outputStyle: null, tools: [], traits: [], surfaces: [] } as never)) as { sections: { id: string }[] }).sections.map(s => s.id)
+  // Env says on, but an explicit stored false wins: start with that.
+  stored['isOn:/proj'] = false
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await sections()).not.toContain('team-chat-lead')
+  expect(((await $.prompt.submit({ text: '@backend do it' } as never)) as { text?: string }).text).toBe('@backend do it')
+  expect(String(((await $.command.run({ command: 'team', args: '' } as never)) as { text: string }).text)).toContain('/team on')
+  expect(String(((await $.command.run({ command: 'team', args: 'list' } as never)) as { text: string }).text)).toContain('dev-team')
+
+  await $.command.run({ command: 'team', args: 'on' } as never)
+  expect(stored['isOn:/proj']).toBe(true)
+  expect(await sections()).toContain('team-chat-lead')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await sections()).toContain('team-chat-lead')
+
+  expect(closed).toEqual([])
+  await $.command.run({ command: 'team', args: 'off' } as never)
+  expect(closed).toEqual(['team-chat'])
+  expect(stored['isOn:/proj']).toBe(false)
+  expect(await sections()).not.toContain('team-chat-lead')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await sections()).not.toContain('team-chat-lead')
+  // /team <name> turns it on again.
+  await $.command.run({ command: 'team', args: 'dev-team' } as never)
+  expect(stored['isOn:/proj']).toBe(true)
+})
+
+test('with no stored choice the view is off, unless TEAM_CHAT=on at launch', async ($, on) => {
+  stubTeam(on)
+  on('prompt.compose', () => ({ sections: [] }))
+  const sections = async () => ((await $.prompt.compose({ promptModel: 'm', outputStyle: null, tools: [], traits: [], surfaces: [] } as never)) as { sections: { id: string }[] }).sections.map(s => s.id)
+  // stubEngine answers TEAM_CHAT=on: the launch override turns it on with no stored flag.
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await sections()).toContain('team-chat-lead')
+})
+
+test('overview bottom chat shows the 5 newest messages, newest last; long lines roll, short ones stay still', async ($, on) => {
+  stubTeam(on)
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.toast', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({ prompt: 'x', description: 'x', subagentType: 'team-chat:backend' })
+  for (let n = 1; n <= 7; n++) await $.session.send({ to: 'backend', text: `short ${n}`, origin: { kind: 'model' } } as never)
+  const long = 'a very long message that cannot possibly fit in a forty column wide side pane at all'
+  await $.session.send({ to: 'backend', text: long, origin: { kind: 'model' } } as never)
+  const props = { ...PANE.props, bodyColumns: 40, scroll: { offset: 0, bodyRows: 30 } }
+  const ui = await $.ui.mount({ ...PANE, props, surface: 'desktop' } as never)
+  const has = async (re: RegExp) => (await ui.find({ type: 'Text', text: re })) !== undefined
+  expect(await has(/short 7/)).toBe(true)
+  expect(await has(/short 7/)).toBe(true)
+  expect(await has(/short 4/)).toBe(true)
+  expect(await has(/short 3/)).toBe(false)
+  // The long line is cut to the pane (it rolls), never shown whole.
+  expect(await has(new RegExp(long))).toBe(false)
+  // ...but one row still carries a window of it, exactly as wide as what is left of the row (rolling).
+  expect(await has(/→ backend · (?!short).{15}$/)).toBe(true)
+  await ui.unmount()
 })

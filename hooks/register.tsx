@@ -37,13 +37,17 @@ const activeTab = atom({ plugin: 'team-chat', key: 'tab' } as const, 'overview')
 const queue = atom({ plugin: 'team-chat', key: 'queue' } as const, [], { shape: 'queue-1' })
 const queueNext = atom({ plugin: 'team-chat', key: 'queueNext' } as const, 1)
 /** How far the pane body is scrolled below the fixed header: blocks hidden at the start (Chat: hidden at the end, 0 = newest). */
-const isChainOpen = atom({ plugin: 'team-chat', key: 'isChainOpen' } as const, false)
 const bodyOffset = atom({ plugin: 'team-chat', key: 'bodyOffset' } as const, 0)
 /** Chat: the id of the newest message in view, so new messages never shift it; 0 follows the newest. */
 const chatAnchor = atom({ plugin: 'team-chat', key: 'chatAnchor' } as const, 0)
+/** The session's context window and fill, from session.measure. */
+const ctx = atom({ plugin: 'team-chat', key: 'ctx' } as const, null as Ctx | null)
+/** The session's rate-limit windows (five_hour, seven_day), from session.measure. Percent only: the engine gives no absolute counts. */
+const limits = atom({ plugin: 'team-chat', key: 'limits' } as const, [] as RateLimit[])
 
 const TABS: { id: Tab; label: string; hot: string }[] = [
   { id: 'overview', label: 'Overview', hot: 'o' },
+  { id: 'chain', label: 'Chain', hot: 'h' },
   { id: 'files', label: 'Files', hot: 'f' },
 ]
 
@@ -54,6 +58,9 @@ async function resetScroll($: EngineInterface) {
 }
 
 /** Terminal columns a text takes: wide characters and emoji count two, joiners and marks none. */
+/** BMP emoji that terminals draw two columns wide (East Asian Width W), e.g. ⭐ ✅ ⚡. */
+const WIDE_BMP_EMOJI = new Set([0x231a, 0x231b, 0x23e9, 0x23ea, 0x23eb, 0x23ec, 0x23f0, 0x23f3, 0x25fd, 0x25fe, 0x2614, 0x2615, ...Array.from({ length: 12 }, (_, i) => 0x2648 + i), 0x267f, 0x2693, 0x26a1, 0x26aa, 0x26ab, 0x26bd, 0x26be, 0x26c4, 0x26c5, 0x26ce, 0x26d4, 0x26ea, 0x26f2, 0x26f3, 0x26f5, 0x26fa, 0x26fd, 0x2705, 0x270a, 0x270b, 0x2728, 0x274c, 0x274e, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795, 0x2796, 0x2797, 0x27b0, 0x27bf, 0x2b1b, 0x2b1c, 0x2b50, 0x2b55])
+
 function textWidth(text: string): number {
   let w = 0
   for (const ch of text) {
@@ -61,9 +68,37 @@ function textWidth(text: string): number {
     if (c === 0x200d || (c >= 0xfe00 && c <= 0xfe0f) || (c >= 0x300 && c <= 0x36f)) continue
     const isWide = (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff) ||
       (c >= 0xfe30 && c <= 0xfe6f) || (c >= 0xff00 && c <= 0xff60) || (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x1f300 && c <= 0x1faff) || (c >= 0x20000 && c <= 0x3fffd)
-    w += isWide ? 2 : 1
+    w += isWide || WIDE_BMP_EMOJI.has(c) ? 2 : 1
   }
   return w
+}
+
+/**
+ * One frame of a marquee: text that fits is returned as is; longer text scrolls left one character per frame in a loop
+ * (a short gap before it repeats, a pause at the start). The slice is always at most `width` columns, wide characters
+ * count two and zero-width marks stay with their base character.
+ */
+export function marqueeSlice(text: string, width: number, frame: number, gap = '   ', pause = 6): string {
+  const w = Math.max(1, Math.floor(width))
+  if (textWidth(text) <= w) return text
+  const cells: { s: string; w: number }[] = []
+  for (const ch of text + gap) {
+    const cw = textWidth(ch)
+    if (cw === 0 && cells.length > 0) cells[cells.length - 1]!.s += ch
+    else cells.push({ s: ch, w: cw })
+  }
+  const n = cells.length
+  const k = Math.max(0, Math.floor(frame)) % (n + pause)
+  let at = Math.max(0, k - pause)
+  let out = ''
+  let used = 0
+  for (let i = 0; i < n; i++, at = (at + 1) % n) {
+    const c = cells[at]!
+    if (used + c.w > w) break
+    out += c.s
+    used += c.w
+  }
+  return out + ' '.repeat(w - used)
 }
 
 /** Shows a tab and remembers it. Every tab opens at its natural end: top for the lists, newest for Chat. */
@@ -206,6 +241,7 @@ let isDispatching = false
 let isDispatchAsked = false
 /** Sends each queued task to its member, through the usual routing, once that member is idle or done and not flagged. */
 async function dispatchQueue($: EngineInterface) {
+  if (isOff) return
   if (isDispatching || isSwitching) {
     // A trigger that arrives mid-loop is not lost: the loop runs once more.
     isDispatchAsked = true
@@ -303,7 +339,7 @@ Run a fixed team of subagents. Your session is the **lead**: it splits your task
 4. **Talk to one member**: \`@qa run the e2e suite\` in the chat, or ✉ message on its box.
 
 ## Reading the pane
-- **⠋ working**: busy. **◆ needs help**: blocked on a teammate. **⚑ needs you**: waiting on you (a permission prompt, or a NEEDS-HUMAN: question). Both show the reason and blink. The flag clears when the permission is answered, you message the member, or it resumes. Caveat: if the permission mode settles an ask by itself, or the ask is denied, the flag can flash or stay until the member's next call, a poll that sees it running, or the end of its turn. **✦ ✓ done**: finished. **○ idle**.
+- **⠋ working**: busy. **◆ needs help**: blocked on a teammate. **⚑ needs you**: waiting on you (a permission prompt, or a NEEDS-HUMAN: question). Both show the reason and blink. The flag clears when the permission is answered or its tool runs, the member's next step starts, you message it, or a newer message from it replaces the blocked one. A member that is done or idle never shows a flag: a BLOCKED: line in its final answer stays in the chat, not as a flag. **✦ ✓ done**: finished. **○ idle**.
 - **task** is what it was asked; **now** is a live one-line summary of what it is doing; **▸** is its latest action.
 - **#team** shows every assignment, message and report, including messages between members and their reports. Each is cut to two lines; click one to expand or collapse it. ✉ shows one conversation; × back returns.
 - Click a member's name to expand it: its purpose, last actions and report.
@@ -329,11 +365,12 @@ Run a fixed team of subagents. Your session is the **lead**: it splits your task
 - \`/team\`: open the pane
 - \`/new\`, \`/clear\`: keep the active team
 - \`/team list\`: list the project's teams
+- \`/team on\` | \`/team off\`: the team view is off by default (a plain Claude Code chat); \`/team on\` turns it on for the project (remembered, also for /new and /clear) and \`/team off\` back off. \`TEAM_CHAT=on claude\` starts a session with it on.
 - \`/team new <name> [from]\`: new team: lead only, or copied from an existing team
 - \`/team add | edit | remove <member>\`: manage members; reorder them with the ↑/↓ buttons in the pane or \`/team-chat:janitor reorder\`
 - \`/team close | open\`: one-line view or full boxes
 - \`/team layout auto|compact|wide|mini\`: how the pane draws members; \`/team palette pastel|default\`
-- Pane keys (pane focused): on Overview, \`l\` toggles the event log. Click a member to expand it.
+- Pane keys (pane focused): click a member to expand it.
 - \`/team reload\`: re-read the team file
 - \`/team tab overview|files\`: pick a tab; \`/team queue <member|any> <task>\` queues a task that is sent when that member is free
 - \`/team files\`: the team's shared files
@@ -387,7 +424,7 @@ function look(one: Live, tNow: number): Look {
     }
     case 'human': {
       const on = Math.floor(tNow / 400) % 2 === 0
-      return { glyph: on ? '⚑' : '⚐', label: 'needs human', color: on ? 'error' : 'subtle', border: on ? 'error' : 'subtle', isLive: true }
+      return { glyph: on ? '⚑' : '⚐', label: 'needs you', color: on ? 'error' : 'subtle', border: on ? 'error' : 'subtle', isLive: true }
     }
     case 'done': {
       const since = one.endedAt ? tNow - one.endedAt : CELEBRATE_MS
@@ -482,10 +519,17 @@ export function permissionFlag(e: { tool?: unknown; tool_use_id?: string; agentI
   return { status: 'human', reason: `permission: ${String(e.tool)}`, flagSource: 'permission', flagCall: e.tool_use_id, flagTool: String(e.tool) }
 }
 
-/** A call starting: does the member keep its flag? A permission flag tied to a pending call stays (a poll-set one, with no call, does not); a message flag stays for the member's own SendMessage. */
-export function keepsFlag(one: Live, isOwnMessage: boolean): boolean {
-  if (one.status !== 'waiting' && one.status !== 'human') return false
-  if (one.flagSource === 'permission') return one.flagCall !== undefined || one.flagTool !== undefined
+/**
+ * A call starting: does the member keep its flag? The member's next step clears it, except:
+ * - a permission flag stays for its own pending call (same id, or the same tool when an id is missing): the prompt is still open until that call ends;
+ * - a message flag (BLOCKED:/NEEDS-HUMAN: in a SendMessage) stays for that member's own SendMessage.
+ */
+export function keepsFlag(one: Live, isOwnMessage: boolean, call?: { tool?: unknown; tool_use_id?: string }): boolean {
+  if (one.status !== 'human' && one.status !== 'waiting') return false
+  if (one.flagSource === 'permission') {
+    if (!call) return true
+    return one.flagCall !== undefined && call.tool_use_id !== undefined ? one.flagCall === call.tool_use_id : one.flagTool === String(call.tool)
+  }
 
   return one.flagSource === 'message' && isOwnMessage
 }
@@ -499,13 +543,48 @@ export function afterCall(one: Live, e: { tool?: unknown; tool_use_id?: string }
     : one
 }
 
-async function flagPermission($: EngineInterface, e: { tool?: unknown; tool_use_id?: string; agentId?: string }, res: unknown) {
+/** How long an 'ask' must stay pending before the flag shows: a call that runs at once (no prompt) never flashes "needs you". */
+export const PERMISSION_FLAG_DELAY_MS = 1500
+
+type PendingAsk = { agentId: string; tool: string; id?: string; timer: ReturnType<typeof setTimeout> }
+const pendingAsks = new Set<PendingAsk>()
+
+/** Does a pending ask belong to this call? Ids decide when both exist (parallel calls), else the tool name. */
+function isSameCall(p: { tool: string; id?: string }, e: { tool?: unknown; tool_use_id?: string }): boolean {
+  return p.id !== undefined && e.tool_use_id !== undefined ? p.id === e.tool_use_id : p.tool === String(e.tool)
+}
+
+/** The call started or ended: its delayed permission flag must not show. */
+export function cancelPendingAsk(e: { tool?: unknown; tool_use_id?: string; agentId?: string }): void {
+  for (const p of [...pendingAsks]) {
+    if (p.agentId === e.agentId && isSameCall(p, e)) {
+      clearTimeout(p.timer)
+      pendingAsks.delete(p)
+    }
+  }
+}
+
+/** Schedules the permission flag; it is set only if the same call is still pending after the delay. */
+export function schedulePermissionFlag(fire: (flag: Partial<Live>) => void, e: { tool?: unknown; tool_use_id?: string; agentId?: string }, res: unknown, delay = PERMISSION_FLAG_DELAY_MS): void {
   const flag = permissionFlag(e, res)
-  if (!flag) return
-  const t = await read($, team)
-  const who = memberOfAgent(t, await read($, live), e.agentId)
-  if (!t?.members.some(m => m.name === who)) return
-  await setLive($, who, one => ({ ...one, ...flag }))
+  if (!flag || e.agentId === undefined) return
+  cancelPendingAsk(e)
+  const p: PendingAsk = {
+    agentId: e.agentId, tool: String(e.tool), id: e.tool_use_id,
+    timer: setTimeout(() => { pendingAsks.delete(p); fire(flag) }, delay),
+  }
+  pendingAsks.add(p)
+}
+
+async function flagPermission($: EngineInterface, e: { tool?: unknown; tool_use_id?: string; agentId?: string }, res: unknown) {
+  schedulePermissionFlag(flag => {
+    void quietly(async () => {
+      const t = await read($, team)
+      const who = memberOfAgent(t, await read($, live), e.agentId)
+      if (!t?.members.some(m => m.name === who)) return
+      await setLive($, who, one => ({ ...one, ...flag }))
+    })
+  }, e, res)
 }
 
 async function setLive($: EngineInterface, name: string, fn: (one: Live) => Live) {
@@ -546,6 +625,11 @@ async function post($: EngineInterface, msg: Omit<Msg, 'ts' | 'id'>) {
   await quietly(async () => $.store.set(await channelKey($), kept))
   const ids = new Set(kept.map(m => m.id))
   await update($, openMsgs, cur => cur.filter(x => ids.has(x)))
+}
+
+/** A 'waiting' flag that came from the member's own words (a BLOCKED answer or message): a resume, a message to it or the lead's next finished turn supersedes it. */
+function isStaleHelp(one: Live): boolean {
+  return one.status === 'waiting' && (one.flagSource === 'answer' || one.flagSource === 'message')
 }
 
 function teamFile(t: Team): string {
@@ -677,6 +761,7 @@ const SHORT_HELP = `/team                         open the pane
 /team list                    list teams
 /team queue [<member|any> <task> | rm #<id>]   queue work
 /team view full|compact|wide|mini|pastel|default
+/team on | off                turn the team view on (it is off until you do) or off
 /team help                    this list
 Create a team: /team-chat:create   Edit/rename/delete: /team-chat:janitor   Full guide: /team-chat:help`
 
@@ -687,13 +772,13 @@ const REMOVED: Record<string, string> = {
   add: 'Use + member / ✎ edit in the pane, or /team-chat:janitor.',
   edit: 'Use + member / ✎ edit in the pane, or /team-chat:janitor.',
   remove: 'Use + member / ✎ edit in the pane, or /team-chat:janitor.',
-  tab: 'Click a tab, or use /team tab overview|files.',
+  tab: 'Click a tab, or use /team tab overview|chain|files.',
   files: 'Open 📁 Files in the pane.',
   reload: 'Team files reload automatically.',
 }
 /** Kept for muscle memory, not in the help. */
 const ALIASES = ['switch', 'open', 'close', 'layout', 'palette']
-const VERBS = ['list', 'queue', 'view', 'help']
+const VERBS = ['list', 'queue', 'view', 'help', 'on', 'off']
 const VIEWS = ['full', 'compact', 'wide', 'mini', 'pastel', 'default']
 
 /** Levenshtein distance, for "did you mean". */
@@ -792,6 +877,49 @@ async function channelKey($: EngineInterface): Promise<string> {
 
 async function lastTeamKey($: EngineInterface): Promise<string> {
   return `lastTeam:${await $.session.cwd()}`
+}
+
+/** The team view is opt-in per project: until /team on (or /team <name>, /team-chat:start, start_team) sets this flag, the session is a plain Claude Code chat. */
+async function onKey($: EngineInterface): Promise<string> {
+  return `isOn:${await $.session.cwd()}`
+}
+
+/** Module state survives /new and /clear; session.start recomputes it from the stored flag and TEAM_CHAT. */
+let isOff = true
+
+/** Reads the engine's usage into the ctx and limits atoms, so the pane's usage row has values from the first frame. */
+async function refreshUsage($: EngineInterface) {
+  await quietly(async () => {
+    const u = await $.session.usage()
+    await update($, ctx, () => u.context)
+    await update($, limits, () => cleanLimits((u as { rateLimits?: unknown }).rateLimits))
+  })
+}
+
+function registerTeamCommand($: EngineInterface) {
+  return $.command.register({
+    name: 'team',
+    description: 'Open the team pane, switch team, or queue work. The team view is off until /team on. /team help lists the verbs.',
+    argumentHint: '[on | off | <team> | list | queue [<member|any> <task>] | view <mode> | help]',
+  })
+}
+
+/** Turns the team view on and remembers it for this project. */
+async function turnOn($: EngineInterface) {
+  if (!isOff) return
+  isOff = false
+  await quietly(async () => $.store.set(await onKey($), true))
+}
+
+/** Loads the active or last team of this project, as session.start does; a project with one team loads it. */
+async function loadLastTeam($: EngineInterface) {
+  const entries = await listTeams($)
+  await update($, teamList, () => entries)
+  let last: unknown = await $.fs.read(ACTIVE_FILE).then(x => x.trim() || undefined, () => undefined)
+  if (!last) last = await $.store.get(await lastTeamKey($)).catch(() => undefined)
+  const pick = entries.find(o => o.name === last) ?? (entries.length === 1 ? entries[0] : undefined)
+  if (pick) await switchTeam($, pick.name, false, true)
+  else await update($, isPicking, () => true)
 }
 
 /** Makes `name` the team you work with: registers its members and tells the lead. */
@@ -1059,12 +1187,95 @@ let tickGen = 0
 /** Handles clock.every returned, cancelled when they are real disposers. */
 const ticks: unknown[] = []
 
+export type Ctx = { tokens?: number; window: number; percent?: number }
+export type RateLimit = { kind: string; percentUsed: number; resetsAt?: string }
+
+/** Keep only well-formed rate-limit entries; anything else the engine sends is dropped. */
+function cleanLimits(raw: unknown): RateLimit[] {
+  if (!Array.isArray(raw)) return []
+  return raw.filter((x): x is RateLimit => !!x && typeof x.kind === 'string' && Number.isFinite(x.percentUsed))
+}
+
+/** One styled run of the usage row. */
+export type Seg = { text: string; color?: 'claude' | 'warning' | 'error'; dim?: boolean }
+
+/** A 10-cell bar with eighth-block resolution: full cells, one partial cell, then the empty track. Returns the filled part and the track apart so they can be colored apart. */
+function meter(pct: number): { fill: string; track: string } {
+  const eighths = Math.round((pct / 100) * 80)
+  const full = Math.floor(eighths / 8)
+  const part = eighths % 8
+  const fill = '█'.repeat(full) + (part ? ' ▏▎▍▌▋▊▉'[part] : '')
+  return { fill, track: '░'.repeat(10 - [...fill].length) }
+}
+
+/** The usage row of the pane, sitting at the bottom: `███▍░░░░░░ 34% · 5h 40% · wk 12%`. Each figure is colored on its own (normal below 70%, warning to 90%, error above) and its bar is drawn in eighths. Under 20 columns only the bar; under 40 the bar and its percent; the 5h/wk parts need 40+ and show only when the engine reported that window. `text` is the plain row and `color` the worst level, `segs` the styled runs. Undefined when nothing is known. */
+export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = []): { text: string; color: 'subtle' | 'warning' | 'error'; segs: Seg[] } | undefined {
+  const level = (p: number) => (p > 90 ? 2 : p >= 70 ? 1 : 0)
+  const clamp = (p: number) => Math.max(0, Math.min(100, Math.round(p)))
+  const hue = (p: number): Seg['color'] => (['claude', 'warning', 'error'] as const)[level(p)]
+  const groups: Seg[][] = []
+  let worst = 0
+  if (c && c.tokens !== undefined && c.window > 0) {
+    const raw = Math.max(0, Math.min(100, c.percent ?? (c.tokens / c.window) * 100))
+    const pct = clamp(raw)
+    const { fill, track } = meter(raw)
+    groups.push([
+      ...(cols < 20 ? [] : [{ text: pct > 90 ? '🔥 ' : '🧠 ' }]),
+      ...(fill ? [{ text: fill, color: hue(pct) }] : []),
+      { text: track, dim: true },
+      ...(cols < 20 ? [] : [{ text: ` ${pct}%`, color: hue(pct) }]),
+    ])
+    worst = level(pct)
+  }
+  if (cols >= 40) {
+    for (const [kind, label] of [['five_hour', '⏳ 5h'], ['seven_day', '📅 wk']] as const) {
+      const w = rl.find(x => x.kind === kind && Number.isFinite(x.percentUsed))
+      if (!w) continue
+      const pct = clamp(w.percentUsed)
+      groups.push([{ text: `${label} `, dim: true }, { text: `${pct}%`, color: hue(pct) }])
+      worst = Math.max(worst, level(w.percentUsed))
+    }
+  }
+  if (groups.length === 0) return undefined
+  const segs = groups.flatMap((g, i) => (i ? [{ text: ' · ', dim: true } as Seg, ...g] : g))
+
+  return { text: segs.map(x => x.text).join(''), color: (['subtle', 'warning', 'error'] as const)[worst], segs }
+}
+
 export const register: Register = on => {
+  on('session.measure', async ($, e, next) => {
+    await update($, ctx, () => e.context)
+    await update($, limits, () => cleanLimits((e as { rateLimits?: unknown }).rateLimits))
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('session.start', async ($, e, next) => {
+    await refreshUsage($)
+    // Opt-in: a stored choice (/team on, /team off) wins; with none, TEAM_CHAT=on at launch turns the view on for the session.
+    let isEnvOn = false
+    await quietly(async () => {
+      isEnvOn = String((await $.env.get('TEAM_CHAT')) ?? '').trim().toLowerCase() === 'on'
+    })
+    let stored: unknown
+    await quietly(async () => {
+      stored = await $.store.get(await onKey($))
+    })
+    isOff = stored === true ? false : stored === false ? true : !isEnvOn
+    if (isOff) {
+      // Plain chat: no team, no pane, no lead announcement, no queue. /team and /team-chat:start still work and turn it back on.
+      await update($, team, () => null)
+      await update($, isPicking, () => false)
+      await quietly(() => registerTools($))
+      await registerTeamCommand($)
+      return next(e)
+    }
     // A team already loaded means this is /new or /clear, not a fresh launch: the context is wiped, so re-tell the lead.
     // The engine types are not in the repo, so there is no known source/reason on session.start; a loaded team is the signal.
     // Module state survives /clear and /new; tickGen > 0 means session.start already ran in this process.
     const isRestart = (await read($, team)) !== null || tickGen > 0
+    // /reload-plugins also lands here but keeps the conversation: a session that already holds context needs no re-announcement.
+    const hasContext = ((await read($, ctx))?.tokens ?? 0) > 3000
+    const isAnnounce = isRestart && !hasContext
     // A new session may come with empty atoms: bring back the saved #team channel.
     if ((await read($, channel)).length === 0) {
       await quietly(async () => {
@@ -1093,7 +1304,7 @@ export const register: Register = on => {
     // A project with one team loads it without asking.
     const pick = entries.find(o => o.name === last) ?? (entries.length === 1 ? entries[0] : undefined)
     const loaded = await read($, team)
-    if (pick) await switchTeam($, pick.name, !isRestart, isRestart)
+    if (pick) await switchTeam($, pick.name, !isRestart, isAnnounce)
     else if (loaded !== null && isRestart) {
       // Nothing readable yet but a team is loaded: keep it.
     } else {
@@ -1113,11 +1324,7 @@ export const register: Register = on => {
       await update($, isPastel, () => pastel === true)
     })
     await quietly(() => registerTools($))
-    await $.command.register({
-      name: 'team',
-      description: 'Open the team pane, switch team, or queue work. /team help lists the verbs.',
-      argumentHint: '[<team> | list | queue [<member|any> <task>] | view <mode> | help]',
-    })
+    await registerTeamCommand($)
     // /new fires session.start again and intervals cannot be cancelled: only the newest registration's callbacks do work.
     const gen = ++tickGen
     for (const h of ticks.splice(0)) void Promise.resolve(h).then(d => (typeof d === 'function' ? d() : (d as { dispose?: () => void } | undefined)?.dispose?.()), () => {})
@@ -1135,7 +1342,7 @@ export const register: Register = on => {
         let name: unknown = (await $.fs.read(ACTIVE_FILE).catch(() => '')).trim() || undefined
         if (!name) name = await $.store.get(await lastTeamKey($))
         const p = again.find(o => o.name === name) ?? (again.length === 1 ? again[0] : undefined)
-        if (p) await switchTeam($, p.name, !isRestart, isRestart)
+        if (p) await switchTeam($, p.name, !isRestart, isAnnounce)
       })
     }
     if (e.surface === 'terminal') {
@@ -1154,6 +1361,7 @@ export const register: Register = on => {
     const name = tokens[1] ?? ''
     const openPane = async () => {
       const cur = await read($, team)
+      await refreshUsage($)
       const r = await $.ui.open({ id: PANE, title: cur ? `Team · ${cur.name}` : 'Team' })
       await update($, isPanePlaced, () => r.isPlaced)
     }
@@ -1162,6 +1370,27 @@ export const register: Register = on => {
 
     // Order: reserved word, then team name, then unknown. These need no team.
     if (sub === 'help') return { text: SHORT_HELP }
+    if (sub === 'off') {
+      isOff = true
+      await quietly(async () => $.store.set(await onKey($), false))
+      await update($, team, () => null)
+      await update($, isPicking, () => false)
+      await update($, queue, () => [])
+      await update($, isPanePlaced, () => false)
+      // Close the pane; /team on reopens it. Failures are ignored (an already-closed pane, a hook's deny).
+      await quietly(async () => $.ui.close({ id: PANE }))
+      return { text: 'Team view is off: this session is a plain chat. /team on turns it on.' }
+    }
+    if (sub === 'on') {
+      await turnOn($)
+      await refreshUsage($)
+      await loadLastTeam($)
+      await openPane()
+      return { text: (await read($, team)) ? `Team view is on, working with ${(await read($, team))?.name}.` : 'Team view is on.' }
+    }
+    if (isOff && (sub === '' || sub === 'queue')) {
+      return { text: 'Team view is off. /team on turns it on.' }
+    }
     if (REMOVED[sub] !== undefined) return { text: REMOVED[sub] }
     // view <mode>; open / close / layout <m> / palette <p> are older spellings of it.
     if (sub === 'view' || sub === 'open' || sub === 'close' || sub === 'layout' || sub === 'palette') {
@@ -1192,6 +1421,7 @@ export const register: Register = on => {
     }
     if (sub === 'switch' || (!VERBS.includes(sub) && entries.some(o => o.name === sub))) {
       const target = sub === 'switch' ? name : sub
+      if (target) await turnOn($)
       if (!target) {
         await update($, isPicking, () => true)
         await openPane()
@@ -1404,8 +1634,8 @@ export const register: Register = on => {
         await setLive($, who, one => ({
           ...one,
           // A SendMessage carrying BLOCKED:/NEEDS-HUMAN: keeps its own flag; any other call means the member moved on.
-          // A permission flag belongs to its pending call (flagCall): only that call going ahead, a poll or turn.complete clears it.
-          ...(keepsFlag(one, isOwnMessage)
+          // A permission flag belongs to its pending call (flagCall); any other call starting, that call ending, a poll or turn.complete clears it.
+          ...(keepsFlag(one, isOwnMessage, e)
             ? {}
             : { status: 'working' as MemberStatus, reason: undefined, flagSource: undefined, flagCall: undefined, flagTool: undefined }),
           activity: what,
@@ -1414,7 +1644,9 @@ export const register: Register = on => {
         }))
       }
     }
+    cancelPendingAsk(e)
     const res = await next(e)
+    cancelPendingAsk(e)
     // This call went ahead (or was denied): a permission prompt for it is over. Another pending call keeps its own flag.
     if (name !== undefined) {
       const who = name
@@ -1438,7 +1670,7 @@ export const register: Register = on => {
     return res
   }).catch(($, e, next) => next(e))
 
-  // The engine's permission verdict: an 'ask' on a member's call is a prompt waiting for the person, flagged at once (poll stays the fallback).
+  // The engine's permission verdict: an 'ask' on a member's call is a prompt waiting for the person, flagged only if still pending after a short delay (poll stays the fallback).
   on('tool.check', async ($, e, next) => {
     const res = await next(e)
     await quietly(() => flagPermission($, e, res))
@@ -1461,6 +1693,8 @@ export const register: Register = on => {
         // BLOCKED:/NEEDS-HUMAN: in a member's own message flags it while it keeps running.
         const ask = t?.members.some(m => m.name === from && !m.isLead) ? needsInput(e.text) : undefined
         if (ask) await setLive($, from, one => ({ ...one, status: ask.status, reason: ask.reason, flagSource: 'message', flagCall: undefined, flagTool: undefined }))
+        // A newer message from the member without a BLOCKED:/NEEDS-HUMAN: line supersedes its earlier blocked one.
+        else if (t?.members.some(m => m.name === from && !m.isLead)) await setLive($, from, one => (one.flagSource === 'message' ? { ...one, status: 'working', reason: undefined, flagSource: undefined, flagCall: undefined, flagTool: undefined } : one))
         await logEvent($, from, 'handoff', `to ${typeof e.to === 'string' ? e.to : memberOfAgent(t, await read($, live), (e.to as { agentId?: string }).agentId)}: ${e.text.split('\n')[0]}`)
       })
     }
@@ -1474,13 +1708,24 @@ export const register: Register = on => {
     const t = await read($, team)
     const agentId = (e as { agentId?: string }).agentId
     const name = memberOfAgent(t, await read($, live), agentId)
+    // The lead finishing a turn means it has seen the hand-backs so far: BLOCKED reports from members that are done are handled, not live asks.
+    if (!agentId) {
+      await update($, live, all => {
+        const stale = Object.entries(all).filter(([k, o]) => k !== name && isStaleHelp(o) && o.flagSource === 'answer')
+        if (stale.length === 0) return all
+        const out = { ...all }
+        for (const [k, o] of stale) out[k] = { ...o, status: 'done', reason: undefined, flagSource: undefined, flagCall: undefined, flagTool: undefined }
+        return out
+      })
+    }
     if (t?.members.some(m => m.name === name)) {
       const text = (e as { answer?: string }).answer || (e as { text?: string }).text || ''
       const ask = needsInput(text)
-      const status: MemberStatus = ask?.status ?? (agentId ? 'done' : 'idle')
+      // A finished member is done (or idle, for the lead): never needs-help/needs-you, even when its last words were BLOCKED:. The words stay in its answer, the chat and the log.
+      const status: MemberStatus = agentId ? 'done' : 'idle'
       const tEnd = await $.clock.now()
       const first = text.split('\n').map(x => x.replace(/^[#*>\-\s]+/, '').trim()).find(Boolean)
-      await setLive($, name, one => ({ ...one, status, activity: undefined, answer: text.slice(0, 600), reason: ask?.reason, flagSource: ask ? 'answer' : undefined, flagCall: undefined, flagTool: undefined, endedAt: tEnd, summary: first?.slice(0, 160) ?? one.summary }))
+      await setLive($, name, one => ({ ...one, status, activity: undefined, answer: text.slice(0, 600), reason: undefined, flagSource: undefined, flagCall: undefined, flagTool: undefined, endedAt: tEnd, summary: first?.slice(0, 160) ?? one.summary }))
       if (agentId && text) await post($, { from: name, to: lead(t)?.name ?? 'lead', text: text.slice(0, 400) })
       await logEvent($, name, 'done', ask ? `${ask.status === 'human' ? 'needs you' : 'needs help'}: ${ask.reason}` : (first ?? 'finished').slice(0, 100))
       if (status === 'done' || status === 'idle') {
@@ -1516,6 +1761,7 @@ export const register: Register = on => {
         </Box>
       )
     }
+    if (isOff) return <Text color="subtle">Team view is off. /team on turns it on.</Text>
     const t = await read($, team)
     const l = await read($, live)
     const msgs = await read($, channel)
@@ -1628,7 +1874,7 @@ export const register: Register = on => {
     const accent = (m: Member) => pc(m.color || 'claude')
     // The lead is the person's own session, so the pane shows the crew only; the chain root reads "you".
     const crew = t.members.filter(m => !m.isLead)
-    const star = (m: Member) => (t.main === m.name ? '★ ' : '')
+    const star = (m: Member) => (t.main === m.name ? '⭐ ' : '')
     const who = (name: string) => t.members.find(m => m.name === name)
     const label = (name: string) => {
       const m = who(name)
@@ -1638,20 +1884,7 @@ export const register: Register = on => {
       return { icon: m.emoji, text: m.name, color: accent(m) }
     }
 
-    // ── Header: team name, live counts as pills, actions ─────────
-    const counts = (['working', 'waiting', 'human', 'done', 'failed'] as const)
-      .map(s => ({ s, n: crew.filter(m => (l[m.name] ?? blank()).status === s).length }))
-      .filter(c => c.n > 0)
-    const pill = (s: MemberStatus, n: number) => {
-      const lk = look({ ...blank(), status: s, endedAt: 0 }, tNow)
-      const word = s === 'waiting' ? 'need help' : s === 'human' ? 'need you' : s
-      return (
-        <Text color={pc(lk.color)} inverse={s === 'waiting' || s === 'human'}>
-          {' '}{lk.glyph} {n} {word}{' '}
-        </Text>
-      )
-    }
-
+    // ── Header: team name and actions (member cards show who needs help or you) ──
     const isBusy = t.members.some(m => !m.isLead && (l[m.name] ?? blank()).status === 'working')
 
     // ── Member card: box, avatar, status, chips, task and summary ─
@@ -1660,9 +1893,17 @@ export const register: Register = on => {
       const isOpen = open === m.name
       const lk = look(one, tNow)
       const elapsed = one.status === 'working' && one.startedAt ? clock(tNow - one.startedAt) : ''
+      // Only working members scroll long action text; everyone else stays static (and truncated).
+      const roll = (text: string, indent: number) => (one.status === 'working' ? marqueeSlice(text, cols - indent - 4, Math.floor(tNow / FRAME_MS)) : text)
       const bar = pc(one.status === 'idle' ? 'subtle' : one.status === 'working' ? accent(m) : lk.border)
 
+      const statusLabel = (
+        <Text key={`status:${m.name}`} wrap="truncate-end" color={pc(lk.color)} inverse={one.status === 'waiting' || one.status === 'human' || one.status === 'working'} weight={one.status === 'waiting' || one.status === 'human' || one.status === 'working' ? 'bold' : undefined}>
+          {' '}{lk.glyph} {lk.label}{elapsed ? ` · ${elapsed}` : ''}{' '}
+        </Text>
+      )
       return (
+        <Box key={`cardwrap:${m.name}`} flexDirection="column" width={cols}>
         <Box
           key={`box:${m.name}`}
           flexDirection="column"
@@ -1687,9 +1928,7 @@ export const register: Register = on => {
                 <Text dimColor> · {m.role}</Text>{mv === m.name ? <Text weight="bold" color="claude">, moving</Text> : ''}</Text>
               </Button>
             )}
-            <Text wrap="truncate-end" color={pc(lk.color)} inverse={one.status === 'waiting' || one.status === 'human'} weight={one.status === 'waiting' || one.status === 'human' ? 'bold' : undefined}>
-              {' '}{lk.glyph} {lk.label}{elapsed ? ` · ${elapsed}` : ''}{' '}
-            </Text>
+            {statusLabel}
           </Box>
           <Text dimColor wrap="truncate-end">
             {'   '}{shortModel(one.model ?? m.model)} · {one.effort ?? (m.isLead ? '…' : m.effort)}
@@ -1705,18 +1944,18 @@ export const register: Register = on => {
           )}
           {one.task && (
             <Text wrap={isOpen ? 'wrap' : 'truncate-end'}>
-              {'   '}<Text dimColor>task </Text>{one.task}
+              {'   '}<Text dimColor>task </Text>{isOpen ? one.task : roll(one.task, 8)}
             </Text>
           )}
           {one.summary && (
             <Text wrap="truncate-end">
               {'   '}<Text dimColor>{one.status === 'working' ? 'now  ' : 'last '}</Text>
-              <Text weight="medium">{one.summary}</Text>
+              <Text weight="medium">{roll(one.summary, 8)}</Text>
             </Text>
           )}
           {one.activity && (
             <Text wrap="truncate-end" dimColor>
-              {'   '}<Text color={accent(m)}>▸</Text> {one.activity}
+              {'   '}<Text color={accent(m)}>▸</Text> {roll(one.activity, 5)}
             </Text>
           )}
           {isOpen && one.recent.slice(-3).map(r => <Text dimColor wrap="truncate-end">{'   '}· {r}</Text>)}
@@ -1744,6 +1983,7 @@ export const register: Register = on => {
               <Button key={`move:${m.name}`} plain label="⇅ move" onPress={() => update($, moving, () => m.name)} />
             </Box>
           )}
+        </Box>
         </Box>
       )
     }
@@ -1915,7 +2155,7 @@ export const register: Register = on => {
                 <Button
                   key="f:main"
                   plain
-                  label={d.isMain ? '★ main member (click to unset)' : '☆ make main member'}
+                  label={d.isMain ? '⭐ main member (click to unset)' : '☆ make main member'}
                   onPress={() => update($, draft, cur => (cur === null ? cur : { ...cur, isMain: !cur.isMain }))}
                 />
               )}
@@ -2066,13 +2306,13 @@ export const register: Register = on => {
         </Box>
       )
     }
-    // Fixed header: two lines, plus a banner line per member that needs help or you (at most two), plus the working strip.
-    // They sit above the body on every tab, so the body gets what is left.
+    // Fixed header: two lines that sit above the body on every tab, so the body gets what is left. Member cards show who needs help or you.
     const flagged = crew.filter(m => ['waiting', 'human'].includes((l[m.name] ?? blank()).status))
-    const banners = flagged.slice(0, 2)
-    const workers = crew.filter(m => (l[m.name] ?? blank()).status === 'working')
-    const headerRows = 2 + banners.length + (workers.length > 0 ? 1 : 0)
-    const bodyBudget = Math.max(4, rows - headerRows)
+    const headerRows = 2
+    // The usage row (context, 5h, wk) is the last row of the pane when anything is known; the body gives up two rows: a rule above it separates it from the chat text, and it never overlaps it.
+    // It shows as soon as the pane loads, whatever the crew is doing; session.start, /team on and opening the pane fill the atoms.
+    const usage = ctxBar((await read($, ctx)) ?? undefined, cols, await read($, limits))
+    const bodyBudget = Math.max(4, rows - headerRows - (usage ? 2 : 0))
 
     // ── Feed: grouped by sender, chat style ──────────────────────
     const shown = v === '#team'
@@ -2222,43 +2462,6 @@ export const register: Register = on => {
             <Button key="help" plain label="? help" onPress={() => update($, isHelpOpen, () => true)} />
           </Box>
         </Box>
-        {banners.map(m => {
-          const one = l[m.name] ?? blank()
-          const lk = look(one, tNow)
-          return (
-            <Box key={`banner:${m.name}`} justifyContent="space-between">
-              <Text wrap="truncate-end" color={pc(lk.color)} weight="bold" inverse={lk.color !== 'subtle'}>
-                {` ${lk.glyph} ${m.emoji} ${m.name}: ${one.status === 'human' ? 'needs you' : 'needs help'}${one.reason ? ` · ${one.reason}` : ''} `}
-              </Text>
-              <Button
-                key={`flag:${m.name}`}
-                plain
-                label="✉ answer"
-                onPress={async () => {
-                  await update($, view, () => `dm:${m.name}`)
-                  await selectTab($, 'overview')
-                  await quietly(async () => { await $.prompt.fill({ text: `@${m.name} `, mode: 'replace' }) })
-                }}
-              />
-            </Box>
-          )
-        })}
-        {workers.length > 0 && (
-          <Box key="working-strip" width={cols}>
-          <Text wrap="truncate-end">
-            <Text dimColor>working </Text>
-            {workers.map(m => {
-              const one = l[m.name] ?? blank()
-              return (
-                <Text key={`work:${m.name}`}>
-                  <Text color={pc('suggestion')}>{look(one, tNow).glyph}</Text> {m.emoji} <Text weight="bold" color={accent(m)}>{m.name}</Text>
-                  <Text dimColor>{one.startedAt ? ` ${clock(tNow - one.startedAt)}` : ''}</Text>{'  '}
-                </Text>
-              )
-            })}
-          </Text>
-          </Box>
-        )}
         <Box justifyContent="space-between">
           <Box gap={1}>
             {TABS.map(x => {
@@ -2337,7 +2540,7 @@ export const register: Register = on => {
     const cardH = (m: Member) => {
       const one = l[m.name] ?? blank()
       const isOpen = open === m.name
-      let n = 4
+      let n = 4 // box
       if (one.status === 'human' || one.status === 'waiting') n += 1
       if (one.task) n += isOpen ? lines(`   task ${one.task}`, cols - 4) : 1
       if (one.summary) n += 1
@@ -2346,49 +2549,9 @@ export const register: Register = on => {
       if (!m.isLead) n += 1
       return n
     }
-    const isChainOpen1 = await read($, isChainOpen)
-    const ovBlocks: Block[] = [
-      {
-        key: 'ov:top',
-        rows: 1,
-        node: (
-          <Box key="ov:top" justifyContent="space-between" width={cols}>
-            {counts.length > 0 ? <Box gap={1}>{counts.map(c => pill(c.s, c.n))}</Box> : <Text dimColor wrap="truncate-end">all quiet · give the lead a task in the chat</Text>}
-            <Button key="log" plain {...hk('l')} label={`${logOpen ? '▾' : '▸'} log`} onPress={() => update($, isLogOpen, cur => !cur)} />
-          </Box>
-        ),
-      },
-    ]
+    const ovBlocks: Block[] = []
     if (pi >= 0) ovBlocks.push({ key: 'ov:movebar', rows: 1, node: <Box key="ov:movebar" gap={2}><Text color="claude" weight="bold">{`moving ${mv}`}</Text><Button key="move:cancel" label="Cancel" onPress={() => update($, moving, () => null)} /></Box> })
     if (crew.length === 0) ovBlocks.push({ key: 'ov:none', rows: 1, node: <Text key="ov:none" dimColor>No members yet. Press + to add one.</Text> })
-    if (hasRelations(t)) {
-      const rowsC = chainRows(t)
-      ovBlocks.push({
-        key: 'ov:chainbtn',
-        rows: 1,
-        node: <Button key="chain" plain label={`${isChainOpen1 ? '▾' : '▸'} chain`} onPress={() => update($, isChainOpen, cur => !cur)} />,
-      })
-      if (isChainOpen1) {
-        ovBlocks.push({
-          key: 'ov:chain',
-          rows: rowsC.length,
-          node: (
-            <Box key="ov:chain" flexDirection="column" width={cols}>
-              {rowsC.map(r => {
-                const m = who(r.name)
-                return (
-                  <Text key={`chain:${r.name}`} wrap="truncate-end">
-                    <Text dimColor>{r.prefix}</Text>
-                    {r.depth === 0 ? <Text weight="bold">👤 you</Text> : <Text>{star(m as Member)}{m?.emoji} <Text color={m ? accent(m) : undefined}>{r.name}</Text></Text>}
-                    {r.handsTo.length > 0 ? <Text dimColor>{` → ${r.handsTo.map(h => (who(h)?.isLead ? 'you' : h)).join(', ')}`}</Text> : null}
-                  </Text>
-                )
-              })}
-            </Box>
-          ),
-        })
-      }
-    }
     if (mode === 'mini') {
       ovBlocks.push({ key: 'ov:mini', rows: pi >= 0 ? crew.length + crew.filter((_, k) => slotOpen(k)).length + (slotOpen(crew.length) ? 1 : 0) : Math.max(1, lines(crew.map(m => `◎ ${m.emoji} ${star(m)}${m.name}  `).join(''), cols)), node: <Box key="ov:mini" width={cols}>{miniLine}</Box> })
       crew.forEach((m, i) => {
@@ -2404,29 +2567,141 @@ export const register: Register = on => {
     }
     if (rcpt !== null) ovBlocks.push({ key: 'ov:receipt', rows: 1 + lines(`receipt  ${clock(0)} · ${(rcpt?.agents.length ?? 0)} agents · ${rcpt?.edits ?? 0} edits · ${rcpt?.errors ?? 0} err`, cols), node: <Box key="ov:receipt" flexDirection="column" width={cols}>{rule()}{receiptLine}</Box> })
     if (logRows.length > 0) ovBlocks.push({ key: 'ov:log', rows: 1 + logRows.reduce((a, x) => a + lines(`${hhmm(x.ts)} ${label(x.who).icon} ${x.who} ${x.kind} · ${x.text}`, cols), 0), node: logPanel })
-    // Bottom panel: only the latest message, pinned at the bottom of the pane (one row).
-    const lastMsg = msgs[msgs.length - 1]
-    const lastPanel = lastMsg && (() => {
-      const f = label(lastMsg.from)
-      const to = label(lastMsg.to)
-      return (
-        <Box key="ov:last" width={cols}>
-          <Text wrap="truncate-end">
-            <Text dimColor>{`${hhmm(lastMsg.ts)} `}</Text>{f.icon} <Text weight="bold" color={f.color}>{f.text}</Text>
-            <Text dimColor>{' → '}</Text>
-            <Text color={to.color}>{to.text}</Text>
-            <Text dimColor>{' · '}</Text>{lastMsg.text.split('\n').filter(x => x.trim()).join(' ').replace(/\s+/g, ' ')}
-          </Text>
-        </Box>
-      )
-    })()
+    // Bottom panel: the 5 newest messages, newest at the bottom, one row each. A line that does not fit rolls (marquee); short ones stay still.
+    // The body keeps at least 3 rows (it had 4 with one row for the panel), so a small pane shows fewer than 5 rather than hide more of the crew.
+    const lastN = Math.max(1, Math.min(5, msgs.length, bodyBudget - 3))
+    const lastRows = msgs.slice(-lastN)
+    let isRollNeeded = false
+    const lastPanel = lastRows.length > 0 && (
+      <Box key="ov:last" flexDirection="column" width={cols}>
+        {lastRows.map((m, idx) => {
+          // Fade by age (no real alpha in a terminal): newest two at full brightness, then dim, the oldest also lose their colors.
+          const age = lastRows.length - 1 - idx
+          const isDim = age >= 2
+          const isMuted = age >= 3
+          const f = label(m.from)
+          const to = label(m.to)
+          const text = m.text.split('\n').filter(x => x.trim()).join(' ').replace(/\s+/g, ' ')
+          const head = `${hhmm(m.ts)} ${f.icon} ${f.text} → ${to.text} · `
+          const room = cols - textWidth(head)
+          const isRoll = room >= 8 && textWidth(text) > room
+          if (isRoll) isRollNeeded = true
+          return (
+            <Box key={`last:${m.id}`} width={cols}>
+              <Text wrap="truncate-end" dimColor={isDim}>
+                <Text dimColor>{`${hhmm(m.ts)} `}</Text>{f.icon} <Text weight="bold" color={isMuted ? 'subtle' : f.color}>{f.text}</Text>
+                <Text dimColor>{' → '}</Text>
+                <Text color={isMuted ? 'subtle' : to.color}>{to.text}</Text>
+                <Text dimColor>{' · '}</Text>{isRoll ? marqueeSlice(text, room, Math.floor(tNow / FRAME_MS)) : text}
+              </Text>
+            </Box>
+          )
+        })}
+      </Box>
+    )
+    isRolling = isRollNeeded
     const overviewBody = (
       <Box flexDirection="column" width={cols} height={bodyBudget}>
-        {windowed(ovBlocks, bodyBudget - (lastPanel ? 1 : 0), false, 1)}
+        {windowed(ovBlocks, bodyBudget - (lastPanel ? lastN : 0), false, 1)}
         <Box flexGrow={1} />
         {lastPanel || null}
       </Box>
     )
+
+    // ── Chain: the reportsTo tree from the lead, with role, model, live status and handsTo arrows ──
+    const chainBody = (() => {
+      const hasChain = hasRelations(t)
+      const wide = cols >= 60
+      // Fit text to a column count (wide characters count two); the end is cut with an ellipsis.
+      const fit = (text: string, w: number) => {
+        if (w <= 0) return ''
+        if (textWidth(text) <= w) return text
+        let out = ''
+        for (const ch of text) {
+          if (textWidth(out + ch) > w - 1) break
+          out += ch
+        }
+        return `${out}…`
+      }
+      const sp = (n: number) => ' '.repeat(Math.max(0, n))
+      const info = chainRows(t).map(r => {
+        const m = who(r.name)
+        const isRoot = r.depth === 0 || !m
+        const one = m ? (l[m.name] ?? blank()) : blank()
+        const lk = look(one, tNow)
+        const stars = m ? star(m) : ''
+        const leftW = isRoot ? 0 : textWidth(r.prefix) + 2 + textWidth(stars) + textWidth(m!.emoji ?? '') + 1 + r.name.length
+        const hands = r.handsTo.length > 0 && !isRoot ? `⇢ ${r.handsTo.map(h => (who(h)?.isLead ? 'you' : h)).join(', ')}` : ''
+        const flagKind = one.status === 'human' ? 'needs you' : one.status === 'waiting' ? 'needs help' : ''
+        const flag = flagKind ? `${flagKind}${one.reason ? `: ${one.reason}` : ''}` : ''
+        const base = m ? `${m.role ?? ''}${wide && m.role ? ' · ' : ''}${wide ? shortModel(one.model ?? m.model).split(' ')[0] : ''}` : ''
+        return { r, m, isRoot, lk, stars, leftW, hands, flagKind, flag, base }
+      })
+      const nameW = Math.max(0, ...info.map(x => x.leftW))
+      const handsW = wide ? Math.min(Math.max(0, ...info.map(x => textWidth(x.hands))), Math.floor(cols * 0.4)) : 0
+      const midWAll = Math.max(0, cols - nameW - 2 - (handsW ? handsW + 2 : 0))
+      const guideOf = (prefix: string) => prefix.replace(/├─ /g, '│  ').replace(/└─ /g, '   ')
+      // Each member is one block of lines: the row, plus its hands-to line when narrow.
+      const blocks = info.filter(x => !x.isRoot).map(x => {
+        const { r, m, lk } = x
+        // A row with no hands-to gives that column's space to role/model.
+        const midW = handsW > 0 && !x.hands ? midWAll + handsW + 2 : midWAll
+        const mid = (() => {
+          if (!x.flagKind) return x.base
+          if (wide && cols >= 120 && x.base) return `${fit(x.base, Math.max(0, midW - 3 - textWidth(x.flag)))}   ${x.flag}`
+          return x.flag
+        })()
+        const flagColor = x.flagKind === 'needs you' ? 'error' : 'warning'
+        const midShown = fit(mid, midW)
+        const flagAt = x.flagKind ? midShown.indexOf(x.flagKind) : -1
+        const midNode = flagAt >= 0
+          ? [<Text key="a" dimColor>{midShown.slice(0, flagAt)}</Text>, <Text key="b" color={flagColor}>{midShown.slice(flagAt)}</Text>]
+          : <Text dimColor>{midShown}</Text>
+        const row = (
+          <Text key={`chain:${r.name}`} wrap="truncate-end">
+            <Text dimColor>{r.prefix}</Text>
+            <Text color={pc(lk.color)}>{lk.glyph}</Text> {x.stars}{m!.emoji} <Text weight="bold" color={accent(m!)}>{r.name}</Text>
+            {midShown || (handsW > 0 && x.hands) ? sp(nameW - x.leftW + 2) : null}{midShown ? midNode : null}
+            {handsW > 0 && x.hands ? <Text color="suggestion">{sp(midW - textWidth(midShown) + 2)}{fit(x.hands, handsW)}</Text> : null}
+          </Text>
+        )
+        const second = !wide && x.hands
+          ? <Text key={`chain:${r.name}:hands`} wrap="truncate-end"><Text dimColor>{guideOf(r.prefix)}   </Text><Text color="suggestion">{fit(x.hands, Math.max(0, cols - textWidth(r.prefix) - 3))}</Text></Text>
+          : null
+        return { key: r.name, rows: second ? 2 : 1, nodes: [row, second] }
+      })
+      const anyFlag = (k: string) => info.some(x => x.flagKind === k)
+      const legendText = `├─ reports to  ⇢ ${cols >= 100 ? 'hands work to' : 'hands to'}${t.main ? '  ⭐ main' : ''}${cols >= 80 && anyFlag('needs you') ? '  ⚑ needs you' : ''}${cols >= 80 && anyFlag('needs help') ? '  ◆ needs help' : ''}`
+      const note = hasChain ? 0 : 1
+      let blank1 = hasChain ? 1 : 0
+      let legend = hasChain ? 1 : 0
+      const need = () => 1 + note + blocks.reduce((a, b) => a + b.rows, 0) + blank1 + legend
+      if (need() > bodyBudget) blank1 = 0
+      if (need() > bodyBudget) legend = 0
+      let keep = blocks.length
+      let hidden = 0
+      if (need() > bodyBudget) {
+        let room = bodyBudget - 1 - note - blank1 - legend - 1 // one line stays for "… N more"
+        keep = 0
+        for (const b of blocks) {
+          if (room < b.rows) break
+          room -= b.rows
+          keep += 1
+        }
+        hidden = blocks.length - keep
+      }
+      const root = info.find(x => x.isRoot)
+      return (
+        <Box flexDirection="column" width={cols} height={bodyBudget}>
+          <Text wrap="truncate-end"><Text weight="bold">👤 you <Text dimColor>(lead)</Text></Text>{handsW > 0 && root ? <Text dimColor>{sp(nameW + 2 + midWAll + 2 - 13)}hands to</Text> : null}</Text>
+          {hasChain ? null : <Text dimColor wrap="truncate-end">No chain yet: every member reports to you. Set reportsTo / handsTo with ✎ edit.</Text>}
+          {blocks.slice(0, keep).flatMap(b => b.nodes)}
+          {hidden > 0 ? <Text dimColor>{`… ${hidden} more`}</Text> : null}
+          {blank1 ? <Text> </Text> : null}
+          {legend ? <Text dimColor wrap="truncate-end">{legendText}</Text> : null}
+        </Box>
+      )
+    })()
 
     // ── Chat: only the newest messages that fit, newest at the bottom ──
     const dmHead = v.startsWith('dm:')
@@ -2453,7 +2728,9 @@ export const register: Register = on => {
       <Box flexDirection="column" width={cols}>
         {header}
         {formView}
-        {d !== null ? null : curTab === 'overview' ? overviewBody : curTab === 'files' ? filesPanel : queueBody}
+        {d !== null ? null : curTab === 'overview' ? overviewBody : curTab === 'chain' ? chainBody : curTab === 'files' ? <Box flexDirection="column" width={cols} height={bodyBudget}>{filesPanel}</Box> : <Box flexDirection="column" width={cols} height={bodyBudget}>{queueBody}</Box>}
+        {usage && d === null ? <Box key="usage-rule" width={cols}>{rule()}</Box> : null}
+        {usage && d === null ? <Box key="usage" width={cols} justifyContent="center"><Text wrap="truncate-end">{usage.segs.map((x, i) => <Text key={i} color={x.color} dimColor={x.dim}>{x.text}</Text>)}</Text></Box> : null}
       </Box>
     )
   })
@@ -2665,6 +2942,7 @@ async function dropTeam($: EngineInterface, name: string) {
 
 /** Picks up hand edits of the team file, and its deletion. */
 async function watchTeamFile($: EngineInterface) {
+  if (isOff) return
   const cur = await read($, team)
   if (cur === null) {
     // No team loaded (e.g. files were unreadable right after /clear): keep looking, and pick the team up once it reads.
@@ -2822,6 +3100,7 @@ function toolText(text: string, isError = false) {
 }
 
 async function openTeamPane($: EngineInterface) {
+  await refreshUsage($)
   const cur = await read($, team)
   const r = await $.ui.open({ id: PANE, title: cur ? `Team · ${cur.name}` : 'Team' })
   await update($, isPanePlaced, () => r.isPlaced)
@@ -2875,6 +3154,7 @@ async function saveTeamTool($: EngineInterface, input: Record<string, unknown>):
   const main = mainHit?.name ?? ''
   const file = `${TEAMS_DIR}/${name}/team.json`
   await $.fs.write(file, `${JSON.stringify({ name, members, ...(main ? { main } : {}) }, null, 2)}\n`)
+  await turnOn($)
   const err = await switchTeam($, name, true)
   if (err) return `Error: saved ${file} but could not start it: ${err}`
   await quietly(() => openTeamPane($))
@@ -2890,6 +3170,7 @@ async function startTeamTool($: EngineInterface, name?: string): Promise<string>
   if (!name) {
     return `Teams in this project:\n${entries.map(o => `- ${o.name} (${o.members} members${o.name === cur?.name ? ', current' : ''})`).join('\n')}\nAsk the person which one to start, then call start_team with its name.`
   }
+  await turnOn($)
   const err = await switchTeam($, name)
   if (err) return `Error: ${err}`
   await quietly(() => openTeamPane($))
@@ -3048,10 +3329,13 @@ async function summarizeWorking($: EngineInterface) {
   }
 }
 
+/** Set by the last Pane render: a chat line there is too wide and rolls, so the frame clock must keep moving. */
+let isRolling = false
+
 async function animate($: EngineInterface) {
   const tNow = await $.clock.now()
   const l = await read($, live)
-  if (Object.values(l).some(o => look(o, tNow).isLive)) await update($, now, () => tNow)
+  if (isRolling || Object.values(l).some(o => look(o, tNow).isLive)) await update($, now, () => tNow)
 }
 
 async function poll($: EngineInterface) {
@@ -3089,9 +3373,12 @@ async function poll($: EngineInterface) {
     await update($, live, all => {
       const cur = all[name]
       if (!cur || cur.status === status) return all
-      // A permission flag ends when the engine reports the agent running again; answer/message flags stay.
-      const isPermissionOver = cur.flagSource === 'permission' && status === 'working'
-      if ((cur.status === 'waiting' || cur.status === 'human') && status !== 'failed' && !isPermissionOver) return all
+      // Flags stay until the person responds (resume, the answered call ending) or the agent fails: the engine reporting 'running' while a prompt is pending is not a response.
+      // The engine reporting the agent running again after its own BLOCKED words is a resume: that flag is superseded.
+      const isResume = status === 'working' && isStaleHelp(cur)
+      // A member that is done or idle never keeps a flag.
+      const isOver = status === 'done' || status === 'idle'
+      if ((cur.status === 'waiting' || cur.status === 'human') && status !== 'failed' && !isResume && !isOver) return all
       isApplied = true
       return {
         ...all,

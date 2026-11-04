@@ -76,7 +76,7 @@ export type LogEntry = { ts: number; who: string; kind: 'spawn' | 'done' | 'edit
 /** The running or last lead turn: what the receipt line sums up. */
 export type Receipt = { startedAt: number; endedAt?: number; agents: string[]; edits: number; errors: number }
 
-export type Tab = 'overview' | 'chat' | 'files' | 'queue'
+export type Tab = 'overview' | 'chain' | 'chat' | 'files' | 'queue'
 
 /** A queued task: sent to its member (or any idle one) when that member is free. */
 export type QueueItem = {
@@ -151,8 +151,11 @@ declare module 'claude-code' {
       /** The next queue task id: never reused. */
       queueNext: number
       bodyOffset: number
-      isChainOpen: boolean
       chatAnchor: number
+      /** The session's context window and fill. */
+      ctx: { tokens?: number; window: number; percent?: number } | null
+      /** Rate-limit windows (five_hour, seven_day), percent used only. */
+      limits: { kind: string; percentUsed: number; resetsAt?: string }[]
     }
   }
 }
