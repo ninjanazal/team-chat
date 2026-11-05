@@ -110,7 +110,7 @@ async function selectTab($: EngineInterface, id: Tab) {
 }
 
 async function queueKey($: EngineInterface, t: Team): Promise<string> {
-  return `queue:${await $.session.cwd()}:${t.name}`
+  return `queue:${projectRoot ?? (await $.session.cwd())}:${t.name}`
 }
 
 /** True while a team switch swaps the queue: nothing is saved or sent until the new team's queue is in. */
@@ -378,10 +378,26 @@ Run a fixed team of subagents. Your session is the **lead**: it splits your task
 `
 const newTeamName = atom({ plugin: 'team-chat', key: 'newTeamName' } as const, '')
 
-const TEAMS_DIR = '.claude/teams'
-const LEGACY_FILE = '.claude/team.json'
+/** Project-relative until session.start pins them to the launch directory (see pinProjectRoot). */
+let TEAMS_DIR = '.claude/teams'
+let LEGACY_FILE = '.claude/team.json'
 /** The project's active team, so a new session (/clear, /new) picks it back up. */
-const ACTIVE_FILE = `${TEAMS_DIR}/.active`
+let ACTIVE_FILE = `${TEAMS_DIR}/.active`
+/** The launch directory, once pinned. Paths stay anchored to it even when the shell's cwd moves (cd into a subfolder). */
+let projectRoot: string | undefined
+
+/**
+ * Anchors every team path to the directory Claude Code was launched in. Relative paths follow the live working
+ * directory, so a `cd` into a subfolder made the teams folder look empty and the team was dropped as "deleted".
+ * The filesystem root ('/') is left relative, as a launch there has no project to anchor to.
+ */
+function pinProjectRoot(cwd: string | undefined) {
+  if (projectRoot !== undefined || !cwd || cwd === '/') return
+  projectRoot = cwd.replace(/\/+$/, '')
+  TEAMS_DIR = `${projectRoot}/.claude/teams`
+  LEGACY_FILE = `${projectRoot}/.claude/team.json`
+  ACTIVE_FILE = `${TEAMS_DIR}/.active`
+}
 const NAME_RE = /^[A-Za-z0-9_-]{1,40}$/
 const MODELS = ['haiku', 'sonnet', 'opus', 'inherit']
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
@@ -872,16 +888,16 @@ async function listTeams($: EngineInterface): Promise<TeamEntry[]> {
 }
 
 async function channelKey($: EngineInterface): Promise<string> {
-  return `channel:${await $.session.cwd()}`
+  return `channel:${projectRoot ?? (await $.session.cwd())}`
 }
 
 async function lastTeamKey($: EngineInterface): Promise<string> {
-  return `lastTeam:${await $.session.cwd()}`
+  return `lastTeam:${projectRoot ?? (await $.session.cwd())}`
 }
 
 /** The team view is opt-in per project: until /team on (or /team <name>, /team-chat:start, start_team) sets this flag, the session is a plain Claude Code chat. */
 async function onKey($: EngineInterface): Promise<string> {
-  return `isOn:${await $.session.cwd()}`
+  return `isOn:${projectRoot ?? (await $.session.cwd())}`
 }
 
 /** Module state survives /new and /clear; session.start recomputes it from the stored flag and TEAM_CHAT. */
@@ -1250,6 +1266,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('session.start', async ($, e, next) => {
+    pinProjectRoot((e as { cwd?: string }).cwd ?? (await $.session.cwd().catch(() => undefined)))
     await refreshUsage($)
     // Opt-in: a stored choice (/team on, /team off) wins; with none, TEAM_CHAT=on at launch turns the view on for the session.
     let isEnvOn = false
