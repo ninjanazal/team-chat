@@ -110,7 +110,7 @@ async function selectTab($: EngineInterface, id: Tab) {
 }
 
 async function queueKey($: EngineInterface, t: Team): Promise<string> {
-  return `queue:${await $.session.cwd()}:${t.name}`
+  return `queue:${projectRoot ?? (await $.session.cwd())}:${t.name}`
 }
 
 /** True while a team switch swaps the queue: nothing is saved or sent until the new team's queue is in. */
@@ -378,10 +378,26 @@ Run a fixed team of subagents. Your session is the **lead**: it splits your task
 `
 const newTeamName = atom({ plugin: 'team-chat', key: 'newTeamName' } as const, '')
 
-const TEAMS_DIR = '.claude/teams'
-const LEGACY_FILE = '.claude/team.json'
+/** Project-relative until session.start pins them to the launch directory (see pinProjectRoot). */
+let TEAMS_DIR = '.claude/teams'
+let LEGACY_FILE = '.claude/team.json'
 /** The project's active team, so a new session (/clear, /new) picks it back up. */
-const ACTIVE_FILE = `${TEAMS_DIR}/.active`
+let ACTIVE_FILE = `${TEAMS_DIR}/.active`
+/** The launch directory, once pinned. Paths stay anchored to it even when the shell's cwd moves (cd into a subfolder). */
+let projectRoot: string | undefined
+
+/**
+ * Anchors every team path to the directory Claude Code was launched in. Relative paths follow the live working
+ * directory, so a `cd` into a subfolder made the teams folder look empty and the team was dropped as "deleted".
+ * The filesystem root ('/') is left relative, as a launch there has no project to anchor to.
+ */
+function pinProjectRoot(cwd: string | undefined) {
+  if (projectRoot !== undefined || !cwd || cwd === '/') return
+  projectRoot = cwd.replace(/\/+$/, '')
+  TEAMS_DIR = `${projectRoot}/.claude/teams`
+  LEGACY_FILE = `${projectRoot}/.claude/team.json`
+  ACTIVE_FILE = `${TEAMS_DIR}/.active`
+}
 const NAME_RE = /^[A-Za-z0-9_-]{1,40}$/
 const MODELS = ['haiku', 'sonnet', 'opus', 'inherit']
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
@@ -512,9 +528,31 @@ async function resume($: EngineInterface, to: string) {
   }
 }
 
+/** Modes where core's 'ask' never reaches the person: a blanket allow or a blanket deny. */
+const SILENT_MODES = ['bypassPermissions', 'dontAsk']
+/** The session's permission mode, as the last classic hook that carries it said (members inherit it). */
+let permissionMode: string | undefined
+export function setPermissionMode(mode: string | undefined): void {
+  if (mode !== undefined) permissionMode = mode
+}
+
+/** Why a tool.check 'ask' raises no flag, or undefined when it does. Only 'ask' verdicts are judged. */
+export function permissionSkip(e: { agentId?: string }, res: unknown): 'no-agent' | 'mode' | undefined {
+  const r = res as { decision?: string; plugin?: string; setting?: string } | undefined
+  if (r?.decision !== 'ask') return undefined
+  if (e.agentId === undefined) return 'no-agent'
+  // A hook's ask (res.plugin) is always the person's. Core's ask: bypass/dontAsk settle it without the person; in auto a classifier settles
+  // plain asks, but a hard ask (res.setting, e.g. the read block) still reaches the person.
+  if (r.plugin !== undefined || permissionMode === undefined) return undefined
+  if (SILENT_MODES.includes(permissionMode)) return 'mode'
+  if (permissionMode === 'auto' && r.setting === undefined) return 'mode'
+
+  return undefined
+}
+
 /** A tool.check verdict of 'ask' on a member's call is a prompt waiting for the person: the flag to set, tied to that call (id when the engine gave one, and tool name). */
 export function permissionFlag(e: { tool?: unknown; tool_use_id?: string; agentId?: string }, res: unknown): Partial<Live> | undefined {
-  if ((res as { decision?: string } | undefined)?.decision !== 'ask' || e.agentId === undefined) return undefined
+  if ((res as { decision?: string } | undefined)?.decision !== 'ask' || permissionSkip(e, res) !== undefined) return undefined
 
   return { status: 'human', reason: `permission: ${String(e.tool)}`, flagSource: 'permission', flagCall: e.tool_use_id, flagTool: String(e.tool) }
 }
@@ -577,11 +615,23 @@ export function schedulePermissionFlag(fire: (flag: Partial<Live>) => void, e: {
 }
 
 async function flagPermission($: EngineInterface, e: { tool?: unknown; tool_use_id?: string; agentId?: string }, res: unknown) {
+  const skip = permissionSkip(e, res)
+  if (skip) {
+    const t = await read($, team)
+    const who = skip === 'no-agent' ? lead(t)?.name ?? 'lead' : memberOfAgent(t, await read($, live), e.agentId)
+    await logEvent($, who, 'note', skip === 'no-agent'
+      ? `ask on ${String(e.tool)}: no agentId, no flag`
+      : `ask on ${String(e.tool)}: no flag (mode ${permissionMode})`)
+    return
+  }
   schedulePermissionFlag(flag => {
     void quietly(async () => {
       const t = await read($, team)
       const who = memberOfAgent(t, await read($, live), e.agentId)
-      if (!t?.members.some(m => m.name === who)) return
+      if (!t?.members.some(m => m.name === who)) {
+        await logEvent($, who, 'note', `ask on ${String(e.tool)}: no member for agent ${String(e.agentId)}, no flag`)
+        return
+      }
       await setLive($, who, one => ({ ...one, ...flag }))
     })
   }, e, res)
@@ -872,16 +922,16 @@ async function listTeams($: EngineInterface): Promise<TeamEntry[]> {
 }
 
 async function channelKey($: EngineInterface): Promise<string> {
-  return `channel:${await $.session.cwd()}`
+  return `channel:${projectRoot ?? (await $.session.cwd())}`
 }
 
 async function lastTeamKey($: EngineInterface): Promise<string> {
-  return `lastTeam:${await $.session.cwd()}`
+  return `lastTeam:${projectRoot ?? (await $.session.cwd())}`
 }
 
 /** The team view is opt-in per project: until /team on (or /team <name>, /team-chat:start, start_team) sets this flag, the session is a plain Claude Code chat. */
 async function onKey($: EngineInterface): Promise<string> {
-  return `isOn:${await $.session.cwd()}`
+  return `isOn:${projectRoot ?? (await $.session.cwd())}`
 }
 
 /** Module state survives /new and /clear; session.start recomputes it from the stored flag and TEAM_CHAT. */
@@ -1208,8 +1258,13 @@ function meter(pct: number): { fill: string; track: string } {
   return { fill, track: '░'.repeat(10 - [...fill].length) }
 }
 
-/** The usage row of the pane, sitting at the bottom: `███▍░░░░░░ 34% · 5h 40% · wk 12%`. Each figure is colored on its own (normal below 70%, warning to 90%, error above) and its bar is drawn in eighths. Under 20 columns only the bar; under 40 the bar and its percent; the 5h/wk parts need 40+ and show only when the engine reported that window. `text` is the plain row and `color` the worst level, `segs` the styled runs. Undefined when nothing is known. */
-export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = []): { text: string; color: 'subtle' | 'warning' | 'error'; segs: Seg[] } | undefined {
+/** Current crew footprint: each member's latest request input (ctx) plus output of its current/last run (out); not a lifetime total. */
+export function crewTokens(l: Record<string, Live>): number {
+  return Object.values(l).reduce((sum, one) => sum + (one.ctx ?? 0) + (one.out ?? 0), 0)
+}
+
+/** The usage row of the pane, sitting at the bottom: `███▍░░░░░░ 34% · 5h 40% · wk 12% · Σ 42k`. Each figure is colored on its own (normal below 70%, warning to 90%, error above) and its bar is drawn in eighths. Under 20 columns only the bar; under 40 the bar and its percent; the 5h/wk parts and the Σ total (crew tokens, when above 0) need 40+, and the 5h/wk parts show only when the engine reported that window. `text` is the plain row and `color` the worst level, `segs` the styled runs. Undefined when nothing is known. */
+export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = [], total = 0): { text: string; color: 'subtle' | 'warning' | 'error'; segs: Seg[] } | undefined {
   const level = (p: number) => (p > 90 ? 2 : p >= 70 ? 1 : 0)
   const clamp = (p: number) => Math.max(0, Math.min(100, Math.round(p)))
   const hue = (p: number): Seg['color'] => (['claude', 'warning', 'error'] as const)[level(p)]
@@ -1235,6 +1290,7 @@ export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = []): 
       groups.push([{ text: `${label} `, dim: true }, { text: `${pct}%`, color: hue(pct) }])
       worst = Math.max(worst, level(w.percentUsed))
     }
+    if (total > 0) groups.push([{ text: 'Σ ', dim: true }, { text: tokens(total) }])
   }
   if (groups.length === 0) return undefined
   const segs = groups.flatMap((g, i) => (i ? [{ text: ' · ', dim: true } as Seg, ...g] : g))
@@ -1250,6 +1306,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('session.start', async ($, e, next) => {
+    pinProjectRoot((e as { cwd?: string }).cwd ?? (await $.session.cwd().catch(() => undefined)))
     await refreshUsage($)
     // Opt-in: a stored choice (/team on, /team off) wins; with none, TEAM_CHAT=on at launch turns the view on for the session.
     let isEnvOn = false
@@ -1675,6 +1732,28 @@ export const register: Register = on => {
     const res = await next(e)
     await quietly(() => flagPermission($, e, res))
     return res
+  }).catch(($, e, next) => next(e))
+
+  // Learn the session's permission mode (the prompt and a real permission dialog both carry it), so tool.check knows whether an 'ask' needs the person.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    setPermissionMode((e as { permission_mode?: string }).permission_mode)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const h = e as { permission_mode?: string; agent_id?: string; agentId?: string; tool_name?: string; tool_use_id?: string }
+    setPermissionMode(h.permission_mode)
+    // A real permission dialog: the person is being asked now, so flag at once (no delay, no mode check).
+    const agentId = h.agent_id ?? h.agentId
+    if (agentId !== undefined) {
+      await quietly(async () => {
+        const t = await read($, team)
+        const who = memberOfAgent(t, await read($, live), agentId)
+        if (!t?.members.some(m => m.name === who && !m.isLead)) return
+        const tool = h.tool_name ?? 'tool'
+        await setLive($, who, one => ({ ...one, status: 'human', reason: `permission: ${tool}`, flagSource: 'permission', flagCall: h.tool_use_id, flagTool: tool }))
+      })
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('session.send', async ($, e, next) => {
@@ -2311,7 +2390,7 @@ export const register: Register = on => {
     const headerRows = 2
     // The usage row (context, 5h, wk) is the last row of the pane when anything is known; the body gives up two rows: a rule above it separates it from the chat text, and it never overlaps it.
     // It shows as soon as the pane loads, whatever the crew is doing; session.start, /team on and opening the pane fill the atoms.
-    const usage = ctxBar((await read($, ctx)) ?? undefined, cols, await read($, limits))
+    const usage = ctxBar((await read($, ctx)) ?? undefined, cols, await read($, limits), crewTokens(await read($, live)))
     const bodyBudget = Math.max(4, rows - headerRows - (usage ? 2 : 0))
 
     // ── Feed: grouped by sender, chat style ──────────────────────

@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { afterCall, keepsFlag, ctxBar, marqueeSlice, permissionFlag, schedulePermissionFlag, cancelPendingAsk } from './register'
+import { setPermissionMode, afterCall, keepsFlag, ctxBar, crewTokens, marqueeSlice, permissionFlag, permissionSkip, schedulePermissionFlag, cancelPendingAsk } from './register'
 
 const PANE = {
   plugin: 'team-chat',
@@ -732,6 +732,8 @@ test('per-member stats from turn.step usage, max_tokens in red, receipt counts a
     expect((await ui.find({ type: 'Text', text: /1 agent/ })) !== undefined).toBe(true)
     expect((await ui.find({ type: 'Text', text: /1 edit/ })) !== undefined).toBe(true)
     expect((await ui.find({ type: 'Text', text: /1 err/ })) !== undefined).toBe(true)
+    // The usage row's total: 38k ctx + 4.1k out from that one request.
+    expect((await ui.find({ type: 'Text', text: /Σ 42k/ })) !== undefined).toBe(true)
     await ui.unmount()
   }
 })
@@ -1753,6 +1755,29 @@ test('ctxBar limit parts: 5h and wk percent, hidden when missing, dropped at nar
   expect(ctxBar(undefined, 90, [])).toBe(undefined)
 })
 
+test('usage row total: Σ crew tokens last, after the limits; hidden at 0 and under 40 columns', () => {
+  const c = { tokens: 38000, window: 200000, percent: 19 }
+  const rl = [{ kind: 'five_hour', percentUsed: 40 }, { kind: 'seven_day', percentUsed: 12 }]
+  expect(ctxBar(c, 90, rl, 42100)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% · 📅 wk 12% · Σ 42k')
+  expect(ctxBar(c, 90, [], 42100)?.text).toBe('🧠 █▉░░░░░░░░ 19% · Σ 42k')
+  expect(ctxBar(c, 90, rl, 0)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% · 📅 wk 12%')
+  expect(ctxBar(c, 39, rl, 42100)?.text).toBe('🧠 █▉░░░░░░░░ 19%')
+  expect(ctxBar(undefined, 90, [], 1500)?.text).toBe('Σ 1.5k')
+  expect(ctxBar(undefined, 90, [], 0)).toBe(undefined)
+  expect(ctxBar(undefined, 39, [], 42100)).toBe(undefined)
+  expect(ctxBar(c, 90, rl, 42100)?.color).toBe('subtle')
+})
+
+test('crew tokens sum each member: latest input plus output so far; members without stats add nothing', () => {
+  const base = { status: 'idle', steps: 0, recent: [] } as const
+  expect(crewTokens({})).toBe(0)
+  expect(crewTokens({
+    lead: { ...base, ctx: 38000, out: 4100 },
+    backend: { ...base, out: 900 },
+    qa: { ...base },
+  })).toBe(43000)
+})
+
 test('context bar is the last row of the pane, with limits; narrow widths drop parts; the prompt hint has no tail', async ($, on) => {
   stubTeam(on)
   on('session.measure', () => ({ changed: ['context'] }))
@@ -1802,6 +1827,30 @@ test('a finished member is never flagged; a newer message from the member supers
   expect(await shows(/needs you: may I drop the table/)).toBe(true)
   await $.turn.complete({ agentId: 'a1', answer: 'finished' } as never)
   expect(await shows(/needs you/)).toBe(false)
+})
+
+test('permission flag by mode: bypass/dontAsk drop core asks, auto keeps only asks with a setting, hook asks always flag', () => {
+  const e = { tool: 'Bash', tool_use_id: 'u1', agentId: 'a1' }
+  const hard = { decision: 'ask', setting: 'permissions.blockReadsOutsideWorkingDirectories' }
+  setPermissionMode('auto')
+  expect(permissionFlag(e, { decision: 'ask' })).toBe(undefined)
+  expect(permissionFlag(e, hard)?.status).toBe('human')
+  for (const mode of ['bypassPermissions', 'dontAsk']) {
+    setPermissionMode(mode)
+    expect(permissionFlag(e, { decision: 'ask' })).toBe(undefined)
+    expect(permissionFlag(e, hard)).toBe(undefined)
+    expect(permissionFlag(e, { decision: 'ask', plugin: 'x' })?.status).toBe('human')
+  }
+  setPermissionMode('default')
+  expect(permissionFlag(e, { decision: 'ask' })?.status).toBe('human')
+})
+
+test('permissionSkip names why an ask raises no flag', () => {
+  setPermissionMode('dontAsk')
+  expect(permissionSkip({ agentId: 'a1' }, { decision: 'ask' })).toBe('mode')
+  expect(permissionSkip({}, { decision: 'ask' })).toBe('no-agent')
+  expect(permissionSkip({}, { decision: 'allow' })).toBe(undefined)
+  setPermissionMode('default')
 })
 
 test('permission flag is delayed: it fires only if the same call is still pending, and a call start or end cancels it', async () => {

@@ -71,7 +71,7 @@ export type Live = {
 }
 
 /** One line of the event log. */
-export type LogEntry = { ts: number; who: string; kind: 'spawn' | 'done' | 'edit' | 'error' | 'handoff'; text: string }
+export type LogEntry = { ts: number; who: string; kind: 'spawn' | 'done' | 'edit' | 'error' | 'handoff' | 'note'; text: string }
 
 /** The running or last lead turn: what the receipt line sums up. */
 export type Receipt = { startedAt: number; endedAt?: number; agents: string[]; edits: number; errors: number }
