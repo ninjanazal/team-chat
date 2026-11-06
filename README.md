@@ -70,7 +70,7 @@ The team view is **off by default**. A session is a plain Claude Code chat (no t
 - 🗂️ **Tabs:** **Overview** (cards and receipt, with a ⚑N badge for members needing help or you), **Chain**, **Files**. The pane remembers the tab.
 - 🃏 **Cards:** each shows `model · effort · ctx · out · steps`. `ctx` is the latest request's input tokens, `out` the output tokens; a `max_tokens` stop shows in red.
 - 🧾 **Receipt:** a line under the header summarises the running or last lead turn: duration, agents used, edits, errors.
-- 📊 **Usage row:** context fill and 5h/wk limits sit centered at the bottom of the pane from the moment it opens.
+- 📊 **Usage row:** context fill, 5h/wk limits and the crew's footprint (`Σ 42k`, each member's latest ctx + out) sit centered at the bottom of the pane from the moment it opens.
 - ⌨️ **Keys:** on Overview, `1`–`9` expands that member's card (full task, last tool calls, start of its answer). Clicking a member does the same.
 - 📜 **Scrolling:** the mouse wheel scrolls; with the pane focused, so do the arrow and page keys. On Chat, **↓ latest** jumps to the newest message.
 - 🔀 **Pick a team:** `/team` asks which one when there are several. The last team is remembered per project, and a lone team loads automatically. **⇄ switch** works only while no member is working (otherwise it reads "⇄ switch (busy)").
@@ -78,7 +78,7 @@ The team view is **off by default**. A session is a plain Claude Code chat (no t
 ## 🚩 Flags
 
 - **⚑ needs you** appears when:
-  - a member asks for permission (its tool check returns `ask`) and the same call is still pending after about 1.5 seconds, so a call that runs at once never flashes it;
+  - a member asks for permission (its tool check returns `ask`, or a permission dialog opens for it) and the same call is still pending after about 1.5 seconds, so a call that runs at once never flashes it;
   - a member sends `NEEDS-HUMAN: <question>`;
   - its `BLOCKED:` line mentions permission or approval.
 - **◆ needs help** appears when a member sends a `BLOCKED:` message mid-run.
@@ -87,8 +87,8 @@ Both blink and show the reason. A flag clears when the permission is answered or
 
 Good to know:
 - A member that has finished (done or idle) never shows a flag: a `BLOCKED:` line in its final answer stays in the chat and the log only.
-- A member only waiting on its own background work or on messages shows as working. Only a tool check `ask` raises the permission flag.
-- A flag can be false when the permission mode settles an ask automatically.
+- A member only waiting on its own background work or on messages shows as working. Only a permission ask (a tool check `ask` or an open permission dialog) raises the permission flag.
+- No flag in `bypassPermissions` or `dontAsk` (the mode settles the ask). In `auto` a plain ask is settled by the classifier, but a hard ask (such as the read-outside-working-directory block) still flags. Skipped asks are noted in the log.
 - After a denied ask, the flag stays until the member's next tool call or the end of its turn. It is matched on the tool call id, falling back to the tool name.
 
 ## 🗣️ Talking to the team
