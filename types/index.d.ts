@@ -155,7 +155,7 @@ declare module 'claude-code' {
       /** The session's context window and fill. */
       ctx: { tokens?: number; window: number; percent?: number } | null
       /** Rate-limit windows (five_hour, seven_day), percent used only. */
-      limits: { kind: string; percentUsed: number; resetsAt?: string }[]
+      limits: { kind: string; percentUsed: number; resetsAt?: string | number }[]
     }
   }
 }

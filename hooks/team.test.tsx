@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { setPermissionMode, afterCall, keepsFlag, ctxBar, crewTokens, marqueeSlice, permissionFlag, permissionSkip, schedulePermissionFlag, cancelPendingAsk } from './register'
+import { resetIn, setPermissionMode, afterCall, keepsFlag, ctxBar, crewTokens, marqueeSlice, permissionFlag, permissionSkip, schedulePermissionFlag, cancelPendingAsk } from './register'
 
 const PANE = {
   plugin: 'team-chat',
@@ -1753,6 +1753,23 @@ test('ctxBar limit parts: 5h and wk percent, hidden when missing, dropped at nar
   expect(ctxBar(c, 39, [{ kind: 'five_hour', percentUsed: 95 }])?.color).toBe('subtle')
   expect(ctxBar(undefined, 90, rl)?.text).toBe('⏳ 5h 40% · 📅 wk 12%')
   expect(ctxBar(undefined, 90, [])).toBe(undefined)
+})
+
+test('5h reset countdown: shown after the 5h percent, hidden when missing, past or invalid', () => {
+  const now = Date.parse('2026-01-01T00:00:00Z')
+  const at = (m: number) => new Date(now + m * 60000).toISOString()
+  const c = { tokens: 38000, window: 200000, percent: 19 }
+  expect(ctxBar(c, 90, [{ kind: 'five_hour', percentUsed: 40, resetsAt: at(134) }, { kind: 'seven_day', percentUsed: 12, resetsAt: at(500) }], 0, now)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% ↻ 2h 14m · 📅 wk 12%')
+  expect(ctxBar(c, 90, [{ kind: 'five_hour', percentUsed: 40, resetsAt: at(14) }], 0, now)?.text).toContain('5h 40% ↻ 14m')
+  expect(ctxBar(c, 90, [{ kind: 'five_hour', percentUsed: 40 }], 0, now)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40%')
+  expect(ctxBar(c, 90, [{ kind: 'five_hour', percentUsed: 40, resetsAt: 'nope' }], 0, now)?.text).toContain('5h 40%')
+  expect(ctxBar(c, 59, [{ kind: 'five_hour', percentUsed: 40, resetsAt: at(134) }, { kind: 'seven_day', percentUsed: 12 }], 0, now)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% · 📅 wk 12%')
+  expect(ctxBar(c, 60, [{ kind: 'five_hour', percentUsed: 40, resetsAt: at(134) }], 0, now)?.text).toBe('🧠 █▉░░░░░░░░ 19% · ⏳ 5h 40% ↻ 2h 14m')
+  expect(resetIn(at(-5), now)).toBe('')
+  expect(resetIn(at(0.5), now)).toBe('1m')
+  expect(resetIn(String(now / 1000 + 3600), now)).toBe('1h 0m')
+  expect(resetIn(now / 1000 + 3600, now)).toBe('1h 0m')
+  expect(resetIn(undefined, now)).toBe('')
 })
 
 test('usage row total: Σ crew tokens last, after the limits; hidden at 0 and under 40 columns', () => {

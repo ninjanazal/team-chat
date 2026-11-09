@@ -1238,7 +1238,7 @@ let tickGen = 0
 const ticks: unknown[] = []
 
 export type Ctx = { tokens?: number; window: number; percent?: number }
-export type RateLimit = { kind: string; percentUsed: number; resetsAt?: string }
+export type RateLimit = { kind: string; percentUsed: number; resetsAt?: string | number }
 
 /** Keep only well-formed rate-limit entries; anything else the engine sends is dropped. */
 function cleanLimits(raw: unknown): RateLimit[] {
@@ -1263,8 +1263,21 @@ export function crewTokens(l: Record<string, Live>): number {
   return Object.values(l).reduce((sum, one) => sum + (one.ctx ?? 0) + (one.out ?? 0), 0)
 }
 
-/** The usage row of the pane, sitting at the bottom: `███▍░░░░░░ 34% · 5h 40% · wk 12% · Σ 42k`. Each figure is colored on its own (normal below 70%, warning to 90%, error above) and its bar is drawn in eighths. Under 20 columns only the bar; under 40 the bar and its percent; the 5h/wk parts and the Σ total (crew tokens, when above 0) need 40+, and the 5h/wk parts show only when the engine reported that window. `text` is the plain row and `color` the worst level, `segs` the styled runs. Undefined when nothing is known. */
-export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = [], total = 0): { text: string; color: 'subtle' | 'warning' | 'error'; segs: Seg[] } | undefined {
+/** Time left until a reset instant, compact (`2h 14m`, `14m`, and `1m` for anything under a minute, rounded up). Accepts an ISO string or epoch seconds/ms; empty when missing, unparseable or already past. */
+export function resetIn(at: unknown, now: number): string {
+  if (at === undefined || at === null || at === '') return ''
+  const isNum = typeof at === 'number' || /^\d+(\.\d+)?$/.test(String(at))
+  const n = isNum ? Number(at) : Date.parse(String(at))
+  if (!Number.isFinite(n)) return ''
+  const ms = isNum && n < 1e11 ? n * 1000 : n
+  const mins = Math.ceil((ms - now) / 60000)
+  if (mins <= 0) return ''
+  const h = Math.floor(mins / 60)
+  return h ? `${h}h ${mins % 60}m` : `${mins}m`
+}
+
+/** The usage row of the pane, sitting at the bottom: `███▍░░░░░░ 34% · 5h 40% · wk 12% · Σ 42k`. Each figure is colored on its own (normal below 70%, warning to 90%, error above) and its bar is drawn in eighths. Under 20 columns only the bar; under 40 the bar and its percent; the 5h/wk parts and the Σ total (crew tokens, when above 0) need 40+, and the 5h/wk parts show only when the engine reported that window. The 5h part also gets a `↻ 2h 14m` countdown to its reset (see `resetIn`) from 60 columns up, when the engine sent a reset time still ahead; `now` is the instant the countdown is measured from (the wall clock by default). `text` is the plain row and `color` the worst level, `segs` the styled runs. Undefined when nothing is known. */
+export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = [], total = 0, now = Date.now()): { text: string; color: 'subtle' | 'warning' | 'error'; segs: Seg[] } | undefined {
   const level = (p: number) => (p > 90 ? 2 : p >= 70 ? 1 : 0)
   const clamp = (p: number) => Math.max(0, Math.min(100, Math.round(p)))
   const hue = (p: number): Seg['color'] => (['claude', 'warning', 'error'] as const)[level(p)]
@@ -1287,7 +1300,8 @@ export function ctxBar(c: Ctx | undefined, cols: number, rl: RateLimit[] = [], t
       const w = rl.find(x => x.kind === kind && Number.isFinite(x.percentUsed))
       if (!w) continue
       const pct = clamp(w.percentUsed)
-      groups.push([{ text: `${label} `, dim: true }, { text: `${pct}%`, color: hue(pct) }])
+      const left = kind === 'five_hour' && cols >= 60 ? resetIn(w.resetsAt, now) : ''
+      groups.push([{ text: `${label} `, dim: true }, { text: `${pct}%`, color: hue(pct) }, ...(left ? [{ text: ` ↻ ${left}`, dim: true }] : [])])
       worst = Math.max(worst, level(w.percentUsed))
     }
     if (total > 0) groups.push([{ text: 'Σ ', dim: true }, { text: tokens(total) }])
@@ -2390,7 +2404,7 @@ export const register: Register = on => {
     const headerRows = 2
     // The usage row (context, 5h, wk) is the last row of the pane when anything is known; the body gives up two rows: a rule above it separates it from the chat text, and it never overlaps it.
     // It shows as soon as the pane loads, whatever the crew is doing; session.start, /team on and opening the pane fill the atoms.
-    const usage = ctxBar((await read($, ctx)) ?? undefined, cols, await read($, limits), crewTokens(await read($, live)))
+    const usage = ctxBar((await read($, ctx)) ?? undefined, cols, await read($, limits), crewTokens(await read($, live)), await $.clock.now())
     const bodyBudget = Math.max(4, rows - headerRows - (usage ? 2 : 0))
 
     // ── Feed: grouped by sender, chat style ──────────────────────
