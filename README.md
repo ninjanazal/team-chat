@@ -70,7 +70,7 @@ The team view is **off by default**. A session is a plain Claude Code chat (no t
 - 🗂️ **Tabs:** **Overview** (cards and receipt, with a ⚑N badge for members needing help or you), **Chain**, **Files**. The pane remembers the tab.
 - 🃏 **Cards:** each shows `model · effort · ctx · out · steps`. `ctx` is the latest request's input tokens, `out` the output tokens; a `max_tokens` stop shows in red.
 - 🧾 **Receipt:** a line under the header summarises the running or last lead turn: duration, agents used, edits, errors.
-- 📊 **Usage row:** context fill, 5h/wk limits and the crew's footprint (`Σ 42k`, each member's latest ctx + out) sit centered at the bottom of the pane from the moment it opens.
+- 📊 **Usage row:** context fill, 5h/wk limits (the 5h one with a `↻` countdown to its reset, from 60 columns wide) and the crew's footprint (`Σ 42k`, each member's latest ctx + out) sit centered at the bottom of the pane from the moment it opens.
 - ⌨️ **Keys:** on Overview, `1`–`9` expands that member's card (full task, last tool calls, start of its answer). Clicking a member does the same.
 - 📜 **Scrolling:** the mouse wheel scrolls; with the pane focused, so do the arrow and page keys. On Chat, **↓ latest** jumps to the newest message.
 - 🔀 **Pick a team:** `/team` asks which one when there are several. The last team is remembered per project, and a lone team loads automatically. **⇄ switch** works only while no member is working (otherwise it reads "⇄ switch (busy)").
